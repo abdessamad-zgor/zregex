@@ -1,5 +1,6 @@
 const std = @import("std");
-const regex = @import("regex/regex.zig");
+const regex = @import("regex/root.zig");
+const debug = std.debug.print;
 
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
@@ -10,11 +11,20 @@ pub fn main() !void {
 
     try bw.flush();
 
-    const text = "paterno sla3nbi moha";
-    var rego = regex.Regex.init("pa");
-    const result = try rego.matchConst(text);
+    const text = "paiterno pap pipo papapa sla3nbi moha";
+    var rego = try regex.Regex.init(std.heap.page_allocator, "pa|i");
+    //defer std.heap.page_allocator.free(rego);
+
+    debug("patterns:\n", .{});
+    for (rego.pattern) |item| {
+        debug("\ttype: {}, symbols: {s}, qualifier: {c}, symbolsLength: {}\n ", .{ item.type, item.symbols, item.qualifier, item.symbols.len });
+    }
+    debug("issymbolsavailable: {} {}", .{ rego.pattern[1].symbols[0], rego.pattern[1].symbols[1] });
+
+    const result = try rego.match(text);
+    debug("matches: {}\n", .{result.matches.len});
     for (result.matches) |match| {
-        std.debug.print("match: {s}, start: {}, length: {}", .{ match.text, match.start, match.length });
+        debug("match: {s}, start: {}, length: {}\n", .{ match.text, match.start, match.length });
     }
 }
 
