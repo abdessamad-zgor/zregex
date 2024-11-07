@@ -11,11 +11,11 @@ pub const MatchResult = struct {
 
 const PatternType = enum { Or, Literal };
 
-const Pattern = struct { symbols: []u8, qualifier: u8, type: PatternType, startIndex: usize };
+const Pattern = struct { symbols: []const u8, qualifier: u8, type: PatternType, startIndex: usize };
 
 const States = enum { Qi, Qf, Qp };
 
-const ParseState = struct { current: States, patterIndex: usize, startIndex: usize };
+const ParseState = struct { current: States, patternIndex: usize, startIndex: usize };
 
 const RegexPatternParseError = error{ IncompleteOrPattern, OutOfMemory };
 
@@ -77,19 +77,18 @@ pub const Regex = struct {
     }
 
     pub fn init(allocator: Allocator, pattern: []const u8) RegexPatternParseError!Regex {
-        const pattern_buf = try allocator.alloc(u8, pattern.len);
-        @memcpy(pattern_buf, pattern);
         var parsedIndexes = std.ArrayList(usize).init(allocator);
         var patternArr = std.ArrayList(Pattern).init(allocator);
         if (zstr.has(pattern, "|")) {
             const or_index = zstr.find(@constCast(pattern), @constCast("|"));
+            var or_symbols = try allocator.alloc(u8, 2);
+            or_symbols[0] = pattern[@intCast(or_index - 1)];
+            or_symbols[1] = pattern[@intCast(or_index + 1)];
             if (or_index == pattern.len - 1 or or_index == 0) {
                 return RegexPatternParseError.IncompleteOrPattern;
             }
             // some wierd shit with how memory works, I don't know enough
-            const left_or = pattern_buf[1];
-            const right_or = pattern_buf[3];
-            const or_pattern = Pattern{ .type = PatternType.Or, .symbols = @constCast(&[_]u8{ left_or, right_or }), .qualifier = '1', .startIndex = @intCast(or_index - 1) };
+            const or_pattern = Pattern{ .type = PatternType.Or, .symbols = or_symbols, .qualifier = '1', .startIndex = @intCast(or_index - 1) };
             try parsedIndexes.appendSlice(&[_]usize{ @intCast(or_index - 1), @intCast(or_index), @intCast(or_index + 1) });
             try patternArr.append(or_pattern);
         }
@@ -102,7 +101,9 @@ pub const Regex = struct {
                 }
             }
             if (!isInParsedIndexs) {
-                const literal_pattern = Pattern{ .type = PatternType.Literal, .symbols = @constCast(&[_]u8{char}), .qualifier = '1', .startIndex = i };
+                var literal_symbol = try allocator.alloc(u8, 1);
+                literal_symbol[0] = char;
+                const literal_pattern = Pattern{ .type = PatternType.Literal, .symbols = literal_symbol, .qualifier = '1', .startIndex = i };
                 try patternArr.append(literal_pattern);
             }
         }

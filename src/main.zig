@@ -17,9 +17,9 @@ pub fn main() !void {
 
     debug("patterns:\n", .{});
     for (rego.pattern) |item| {
-        debug("\ttype: {}, symbols: {s}, qualifier: {c}, symbolsLength: {}\n ", .{ item.type, item.symbols, item.qualifier, item.symbols.len });
+        debug("\ttype: {}, symbols: {s}, qualifier: {c}\n", .{ item.type, item.symbols, item.qualifier });
     }
-    debug("issymbolsavailable: {} {}", .{ rego.pattern[1].symbols[0], rego.pattern[1].symbols[1] });
+    debug("issymbolsavailable: {} {}\n", .{ rego.pattern[1].symbols[0], rego.pattern[1].symbols[1] });
 
     const result = try rego.match(text);
     debug("matches: {}\n", .{result.matches.len});
