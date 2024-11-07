@@ -91,21 +91,6 @@ pub const Regex = struct {
             const right_or = pattern_buf[3];
             const or_pattern = Pattern{ .type = PatternType.Or, .symbols = @constCast(&[_]u8{ left_or, right_or }), .qualifier = '1', .startIndex = @intCast(or_index - 1) };
             try parsedIndexes.appendSlice(&[_]usize{ @intCast(or_index - 1), @intCast(or_index), @intCast(or_index + 1) });
-            //debug("parsed indexs length: {}\n", .{parsedIndexes.items.len});
-            //for (parsedIndexes.items, 0..) |item, i| {
-            //    if (parsedIndexes.items.len == 1) {
-            //        debug("parsed indexs: {}\n", .{item});
-            //    }
-            //    if (i == parsedIndexes.items.len - 1) {
-            //        debug(" {}\n", .{item});
-            //        continue;
-            //    }
-            //    if (i == 0) {
-            //        debug("parsed indexs: {}", .{item});
-            //        continue;
-            //    }
-            //    debug(" {}", .{item});
-            //}
             try patternArr.append(or_pattern);
         }
         for (pattern, 0..) |char, i| {
