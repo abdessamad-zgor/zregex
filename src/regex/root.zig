@@ -9,7 +9,7 @@ pub const MatchResult = struct {
     matches: []Match,
 };
 
-const PatternType = enum { Or, Literal };
+const PatternType = enum { Or, Literal, Range };
 
 const Pattern = struct { symbols: []const u8, qualifier: u8, type: PatternType, startIndex: usize };
 
@@ -17,7 +17,7 @@ const States = enum { Qi, Qf, Qp };
 
 const ParseState = struct { current: States, patternIndex: usize, startIndex: usize };
 
-const RegexPatternParseError = error{ IncompleteOrPattern, OutOfMemory };
+const RegexPatternParseError = error{ IncompleteOrPattern, IncompleteRangePattern, InvalidPattern, WrongLowerAndUpperBound, OutOfMemory };
 
 pub const Regex = struct {
     const Self = @This();
@@ -28,6 +28,26 @@ pub const Regex = struct {
     pattern_index: usize,
     start_index: usize,
 
+    fn step_on_success(self: *Self, index: usize) void {
+        if (self.pattern_index == 0) {
+            self.start_index = index;
+            self.state = States.Qp;
+            self.pattern_index += 1;
+        } else if (self.pattern_index == self.pattern.len - 1) {
+            self.state = States.Qf;
+            self.pattern_index = 0;
+        } else {
+            self.state = States.Qp;
+            self.pattern_index += 1;
+        }
+    }
+
+    fn step_on_failure(self: *Self) void {
+        self.state = States.Qi;
+        self.pattern_index = 0;
+        self.start_index = 0;
+    }
+
     fn transition(self: *Self, char: u8, index: usize) void {
         //debug("patter_index: {}, state: {}\n", .{ self.pattern_index, self.state });
         const indexPattern = self.pattern[@intCast(self.pattern_index)];
@@ -36,41 +56,28 @@ pub const Regex = struct {
             PatternType.Literal => {
                 //debug("char: {c}, indexPatternSymbol: {s}\n", .{ char, indexPattern.symbols });
                 if (char == indexPattern.symbols[0]) {
-                    if (self.pattern_index == 0) {
-                        self.start_index = index;
-                        self.state = States.Qp;
-                        self.pattern_index += 1;
-                    } else if (self.pattern_index == self.pattern.len - 1) {
-                        self.state = States.Qf;
-                        self.pattern_index = 0;
-                    } else {
-                        self.state = States.Qp;
-                        self.pattern_index += 1;
-                    }
+                    self.step_on_success(index);
                 } else {
-                    self.start_index = 0;
-                    self.state = States.Qi;
-                    self.pattern_index = 0;
+                    self.step_on_failure();
                 }
             },
             PatternType.Or => {
                 //debug("char: {c}, indexPatternSymbol: {s}\n", .{ char, indexPattern.symbols });
                 if (char == indexPattern.symbols[0] or char == indexPattern.symbols[1]) {
-                    if (self.pattern_index == 0) {
-                        self.start_index = index;
-                        self.state = States.Qp;
-                        self.pattern_index += 1;
-                    } else if (self.pattern_index == self.pattern.len - 1) {
-                        self.state = States.Qf;
-                        self.pattern_index = 0;
-                    } else {
-                        self.state = States.Qp;
-                        self.pattern_index += 1;
-                    }
+                    self.step_on_success(index);
                 } else {
-                    self.state = States.Qi;
-                    self.pattern_index = 0;
-                    self.start_index = 0;
+                    self.step_on_failure();
+                }
+            },
+            PatternType.Range => {
+                var isInRange = false;
+                for (indexPattern.symbols) |range_char| {
+                    isInRange = isInRange or range_char == char;
+                }
+                if (isInRange) {
+                    self.step_on_success(index);
+                } else {
+                    self.step_on_failure();
                 }
             },
         }
@@ -79,8 +86,9 @@ pub const Regex = struct {
     pub fn init(allocator: Allocator, pattern: []const u8) RegexPatternParseError!Regex {
         var parsedIndexes = std.ArrayList(usize).init(allocator);
         var patternArr = std.ArrayList(Pattern).init(allocator);
+        // Parse or pattern
         if (zstr.has(pattern, "|")) {
-            const or_index = zstr.find(@constCast(pattern), @constCast("|"));
+            const or_index = zstr.find(pattern, "|");
             var or_symbols = try allocator.alloc(u8, 2);
             or_symbols[0] = pattern[@intCast(or_index - 1)];
             or_symbols[1] = pattern[@intCast(or_index + 1)];
@@ -91,6 +99,90 @@ pub const Regex = struct {
             const or_pattern = Pattern{ .type = PatternType.Or, .symbols = or_symbols, .qualifier = '1', .startIndex = @intCast(or_index - 1) };
             try parsedIndexes.appendSlice(&[_]usize{ @intCast(or_index - 1), @intCast(or_index), @intCast(or_index + 1) });
             try patternArr.append(or_pattern);
+        }
+        // Parse range pattern
+        if (zstr.has(pattern, "[")) {
+            if (!zstr.has(pattern, "]")) {
+                return RegexPatternParseError.IncompleteRangePattern;
+            }
+            const left_range = zstr.find(pattern, "[");
+            const right_range = zstr.find(pattern, "]");
+            if (left_range > right_range or right_range - left_range == 1) {
+                return RegexPatternParseError.InvalidPattern;
+            }
+            try parsedIndexes.appendSlice(&[_]usize{ @intCast(left_range), @intCast(right_range) });
+            const range_str = pattern[@intCast(left_range + 1)..@intCast(right_range)];
+            debug("range string: {s}\n", .{range_str});
+            const dashes = try zstr.findAll(allocator, range_str, "-");
+            if (dashes.len == 0) {
+                for (@intCast(left_range)..@intCast(right_range + 1)) |range_index| {
+                    try parsedIndexes.append(range_index);
+                }
+                var symbols = try allocator.alloc(u8, range_str.len);
+                for (range_str, 0..) |range_literal, range_index| {
+                    symbols[range_index] = range_literal;
+                }
+                const range_pattern = Pattern{ .type = PatternType.Range, .symbols = symbols, .qualifier = '1', .startIndex = @intCast(left_range + 1) };
+                try patternArr.append(range_pattern);
+            } else {
+                var symbols = std.ArrayList(u8).init(allocator);
+                debug("dashes: ", .{});
+                for (dashes, 0..) |dash, i| {
+                    if (i == @as(usize, @intCast(dashes.len - 1))) {
+                        debug(" {c}\n", .{range_str[@intCast(dash)]});
+                        break;
+                    }
+                    debug(" {c}", .{range_str[@intCast(dash)]});
+                }
+                for (dashes, 0..) |dash, i| {
+                    if (dash == 0 or dash == range_str.len - 1) {
+                        return RegexPatternParseError.InvalidPattern;
+                    } else if (dashes.len > 1) {
+                        if (i != dashes.len - 1 and dashes[i] == dashes[i + 1] + 1) {
+                            return RegexPatternParseError.InvalidPattern;
+                        } else if (i != dashes.len - 1 and dashes[i] == dashes[i + 1] + 2) {
+                            return RegexPatternParseError.InvalidPattern;
+                        }
+                    }
+                    const lowerBound = range_str[@intCast(dash - 1)];
+                    debug("lowerBound: {c}\n", .{lowerBound});
+                    const upperBound = range_str[@intCast(dash + 1)];
+                    debug("upperBound: {c}\n", .{upperBound});
+                    if (lowerBound > upperBound) {
+                        return RegexPatternParseError.WrongLowerAndUpperBound;
+                    } else {
+                        for (lowerBound..@as(u8, @intCast(upperBound + 1))) |char_in_range| {
+                            try symbols.append(@intCast(char_in_range));
+                        }
+                        try parsedIndexes.appendSlice(&[_]usize{ @as(usize, @intCast(left_range)) + dash, @as(usize, @intCast(left_range)) + dash + 1, (@as(usize, @intCast(left_range)) + dash + 2) });
+                        //debug("parsed range literals: {c} {c} {c}\n", .{ range_str[@intCast(dash - 1)], range_str[@intCast(dash)], range_str[@intCast(dash + 1)] });
+                    }
+                }
+                debug("parsed indexes: ", .{});
+                for (parsedIndexes.items, 0..) |parsedIndex, i| {
+                    if (i == parsedIndexes.items.len - 1) {
+                        debug(" {c}\n", .{pattern[parsedIndex]});
+                    }
+                    debug(" {c}", .{pattern[parsedIndex]});
+                }
+
+                for (range_str, 0..) |range_char, i| {
+                    //if (@intCast(left_range + 1 + i))
+                    var isInParsedIndexs = false;
+                    for (parsedIndexes.items) |parsedIndex| {
+                        if (parsedIndex == @as(usize, @intCast(left_range + 1)) + i) {
+                            isInParsedIndexs = parsedIndex == @as(usize, @intCast(left_range)) + i + 1;
+                            break;
+                        }
+                    }
+                    if (!isInParsedIndexs) {
+                        try symbols.append(range_char);
+                        try parsedIndexes.append(i);
+                    }
+                }
+                const range_pattern = Pattern{ .type = PatternType.Range, .symbols = symbols.items, .qualifier = '1', .startIndex = @intCast(left_range + 1) };
+                try patternArr.append(range_pattern);
+            }
         }
         for (pattern, 0..) |char, i| {
             var isInParsedIndexs = false;

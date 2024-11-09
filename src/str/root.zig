@@ -37,7 +37,7 @@ pub fn toLowerCaseAscii(allocator: Allocator, str: []const u8) ![]u8 {
     return result;
 }
 
-pub fn find(haystack: []u8, needle: []u8) i8 {
+pub fn find(haystack: []const u8, needle: []const u8) i8 {
     var result = false;
     var needle_index: usize = 0;
     var position: i8 = -1;
@@ -63,6 +63,39 @@ pub fn find(haystack: []u8, needle: []u8) i8 {
         }
     }
     return position;
+}
+
+pub fn findAll(allocator: Allocator, haystack: []const u8, needle: []const u8) ![]usize {
+    var indexes = std.ArrayList(usize).init(allocator);
+    var needle_index: usize = 0;
+    var position: i8 = -1;
+    var result = false;
+
+    for (haystack, 0..) |c, i| {
+        if (needle_index == needle.len) {
+            if (result) {
+                needle_index = 0;
+                result = false;
+                try indexes.append(@intCast(position));
+            }
+        }
+        for (i..haystack.len) |j| {
+            _ = j;
+            if (needle[needle_index] == c) {
+                if (needle_index == 0) {
+                    position = @intCast(i);
+                }
+                result = true;
+                needle_index += 1;
+            } else {
+                position = -1;
+                result = false;
+                needle_index = 0;
+            }
+            break;
+        }
+    }
+    return indexes.items;
 }
 
 pub fn equal(src: []const u8, dst: []const u8) bool {
@@ -138,4 +171,15 @@ test "lower case" {
     const lower_result = try toLowerCaseAscii(allocator, str);
 
     try testing.expect(equal(lower_result, "zig"));
+}
+
+test "equal all" {
+    const allocator = std.heap.page_allocator;
+    const str = "Zig is good, Zig is right, Zig is amazing!";
+
+    const findAll_result = try findAll(allocator, str, "Zig");
+
+    try testing.expect(findAll_result[0] == 0);
+    try testing.expect(findAll_result[1] == 13);
+    try testing.expect(findAll_result[2] == 27);
 }

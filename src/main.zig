@@ -11,15 +11,15 @@ pub fn main() !void {
 
     try bw.flush();
 
-    const text = "paiterno pap pipo papapa sla3nbi moha";
-    var rego = try regex.Regex.init(std.heap.page_allocator, "pa|i");
+    const text = "pa ei tirno pap pipo papapa sla3n bi k k moha ra papi, po";
+    var rego = try regex.Regex.init(std.heap.page_allocator, "[a-z]a|i");
     //defer std.heap.page_allocator.free(rego);
 
     debug("patterns:\n", .{});
     for (rego.pattern) |item| {
         debug("\ttype: {}, symbols: {s}, qualifier: {c}\n", .{ item.type, item.symbols, item.qualifier });
     }
-    debug("issymbolsavailable: {} {}\n", .{ rego.pattern[1].symbols[0], rego.pattern[1].symbols[1] });
+    //debug("issymbolsavailable: {} {}\n", .{ rego.pattern[1].symbols[0], rego.pattern[1].symbols[1] });
 
     const result = try rego.match(text);
     debug("matches: {}\n", .{result.matches.len});
