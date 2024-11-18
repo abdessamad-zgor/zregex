@@ -2,6 +2,9 @@ const std = @import("std");
 const zstr = @import("../str/root.zig");
 const debug = std.debug.print;
 const Allocator = std.mem.Allocator;
+// We're gonna use NFA's to parse the Regex expression
+// then register the transition which will tell use how to Parse the regex expression
+// it will give a better way to validate the regex expression and a more predictable way to generate a pattern structure
 
 pub const Match = struct { text: []u8, start: usize, length: usize };
 
@@ -9,235 +12,230 @@ pub const MatchResult = struct {
     matches: []Match,
 };
 
-const PatternType = enum { Or, Literal, Range };
+const PatternType = enum { Or, Literal, ExclusiveRange, Range, Group };
 
-const Pattern = struct { symbols: []const u8, qualifier: u8, type: PatternType, startIndex: usize };
+const Pattern = struct { symbols: ?[][]const u8, patterns: ?[]Pattern, qualifier: u8, type: PatternType, startIndex: usize };
 
-const States = enum { Qi, Qf, Qp };
+const PatternParseResult = struct { type: PatternType, parsed: []usize };
 
-const ParseState = struct { current: States, patternIndex: usize, startIndex: usize };
+const PatternState = enum { RangeStart, Valid, QualifierStart, ValidWithQualifier, ValidQualifier, Lit, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
+const Symbols = enum { lit, char, open_p, close_p, open_b, close_b, ror, cap, ends_w, open_c, close_c, point, star, escape, plus, dash, comma, num };
+const SymbolValue = struct { type: Symbols, value: ?u8, index: usize };
 
-const RegexPatternParseError = error{ IncompleteOrPattern, IncompleteRangePattern, InvalidPattern, WrongLowerAndUpperBound, OutOfMemory };
+const InputState = enum { Qi, Qp, Qe, Qf };
+
+const InputParseState = struct { current: InputState, patternIndex: usize, matchStartIndex: usize };
+const PatternParseState = struct {
+    const Self = @This();
+    /// the stack represents the symbols the belong to a multi charachter construct (i.e groups, altenatives, qualifiers, ..etc)
+    stack: []SymbolValue,
+    /// meaningful characters inside a regex pattern
+    symbols: ?[]SymbolValue,
+    parsedSymbols: ?[]SymbolValue,
+    current: PatternState,
+    fn step(self: *Self, symbol: SymbolValue) void {
+        self.current = self.patternStateOnSymbol(symbol.type);
+    }
+
+    fn patternStateOnSymbol(self: *Self, symbol: Symbols) PatternState {
+        switch (self.current) {
+            PatternState.Init => {
+                return switch (symbol) {
+                    Symbols.lit => PatternState.Valid,
+                    Symbols.open_p => PatternState.GroupStart,
+                    Symbols.open_b => PatternState.RangeStart,
+                    Symbols.escape => PatternState.NeedsEscapeChar,
+                    Symbols.cap => PatternState.StartsWith,
+                    Symbols.point => PatternState.AnyChar,
+                    Symbols.num => PatternState.Valid,
+                    Symbols.char => PatternState.Valid,
+                    else => PatternState.Error,
+                };
+            },
+            PatternState.StartsWith => {
+                return switch (symbol) {
+                    Symbols.lit => PatternState.Valid,
+                    Symbols.num => PatternState.Valid,
+                    Symbols.char => PatternState.Valid,
+                    Symbols.open_b => PatternState.RangeStart,
+                    Symbols.open_p => PatternState.GroupStart,
+                    Symbols.escape => PatternState.NeedsEscapeChar,
+                    Symbols.point => PatternState.Valid,
+                    else => PatternState.Error,
+                };
+            },
+            PatternState.Valid => {
+                return switch (symbol) {
+                    Symbols.star => PatternState.ValidWithQualifier,
+                    Symbols.plus => PatternState.ValidWithQualifier,
+                    Symbols.open_c => PatternState.QualifierStart,
+                    Symbols.open_b => PatternState.RangeStart,
+                    Symbols.open_p => PatternState.GroupStart,
+                    Symbols.lit => PatternState.Valid,
+                    Symbols.num => PatternState.Valid,
+                    Symbols.char => PatternState.Valid,
+                    Symbols.point => PatternState.Valid,
+                    else => PatternState.Error,
+                };
+            },
+            PatternState.ValidWithQualifier => {
+                return switch (symbol) {
+                    Symbols.lit => PatternState.Valid,
+                    Symbols.num => PatternState.Valid,
+                    Symbols.char => PatternState.Valid,
+                    Symbols.open_b => PatternState.RangeStart,
+                    Symbols.open_p => PatternState.GroupStart,
+                    else => PatternState.Error,
+                };
+            },
+            PatternState.QualifierStart => {
+                return switch (symbol) {
+                    Symbols.num => PatternState.ValidQualifier,
+                    else => PatternState.Error,
+                };
+            },
+        }
+    }
+};
+
+const RegexPatternParseError = error{ IncompleteGroupPattern, IncompleteOrPattern, IncompleteRangePattern, InvalidPattern, InvalidGroupPattern, WrongLowerAndUpperBound, OutOfMemory };
 
 pub const Regex = struct {
     const Self = @This();
 
+    allocator: Allocator,
+
     pattern: []Pattern,
 
-    state: States,
-    pattern_index: usize,
-    start_index: usize,
+    state: InputParseState,
+    patternState: PatternParseState,
 
-    fn step_on_success(self: *Self, index: usize) void {
-        if (self.pattern_index == 0) {
-            self.start_index = index;
-            self.state = States.Qp;
-            self.pattern_index += 1;
-        } else if (self.pattern_index == self.pattern.len - 1) {
-            self.state = States.Qf;
-            self.pattern_index = 0;
+    fn stepOnSuccess(self: *Self, index: usize) void {
+        if (self.state.patternIndex == 0) {
+            self.state.matchStartIndex = index;
+            self.state.current = InputState.Qp;
+            self.state.patternIndex += 1;
+        } else if (self.state.patternIndex == self.pattern.len - 1) {
+            self.state.current = InputState.Qf;
+            self.state.patternIndex = 0;
         } else {
-            self.state = States.Qp;
-            self.pattern_index += 1;
+            self.state.current = InputState.Qp;
+            self.state.patternIndex += 1;
         }
     }
 
-    fn step_on_failure(self: *Self) void {
-        self.state = States.Qi;
-        self.pattern_index = 0;
-        self.start_index = 0;
+    fn stepOnFailure(self: *Self) void {
+        if (self.state.current == InputState.Qp) {
+            self.state.current = InputState.Qe;
+        } else {
+            self.state.current = InputState.Qi;
+        }
+        self.state.patternIndex = 0;
+        self.state.matchStartIndex = 0;
     }
 
-    fn transition(self: *Self, char: u8, index: usize) void {
-        //debug("patter_index: {}, state: {}\n", .{ self.pattern_index, self.state });
-        const indexPattern = self.pattern[@intCast(self.pattern_index)];
-        //debug("indexPatternSymbol: {s}\n", .{indexPattern.symbols});
-        switch (indexPattern.type) {
-            PatternType.Literal => {
-                //debug("char: {c}, indexPatternSymbol: {s}\n", .{ char, indexPattern.symbols });
-                if (char == indexPattern.symbols[0]) {
-                    self.step_on_success(index);
-                } else {
-                    self.step_on_failure();
-                }
-            },
-            PatternType.Or => {
-                //debug("char: {c}, indexPatternSymbol: {s}\n", .{ char, indexPattern.symbols });
-                if (char == indexPattern.symbols[0] or char == indexPattern.symbols[1]) {
-                    self.step_on_success(index);
-                } else {
-                    self.step_on_failure();
-                }
-            },
-            PatternType.Range => {
-                var isInRange = false;
-                for (indexPattern.symbols) |range_char| {
-                    isInRange = isInRange or range_char == char;
-                }
-                if (isInRange) {
-                    self.step_on_success(index);
-                } else {
-                    self.step_on_failure();
-                }
-            },
-        }
-    }
-
-    pub fn init(allocator: Allocator, pattern: []const u8) RegexPatternParseError!Regex {
-        var parsedIndexes = std.ArrayList(usize).init(allocator);
-        var patternArr = std.ArrayList(Pattern).init(allocator);
-        // Parse or pattern
-        if (zstr.has(pattern, "|")) {
-            const or_index = zstr.find(pattern, "|");
-            var or_symbols = try allocator.alloc(u8, 2);
-            or_symbols[0] = pattern[@intCast(or_index - 1)];
-            or_symbols[1] = pattern[@intCast(or_index + 1)];
-            if (or_index == pattern.len - 1 or or_index == 0) {
-                return RegexPatternParseError.IncompleteOrPattern;
-            }
-            // some wierd shit with how memory works, I don't know enough
-            const or_pattern = Pattern{ .type = PatternType.Or, .symbols = or_symbols, .qualifier = '1', .startIndex = @intCast(or_index - 1) };
-            try parsedIndexes.appendSlice(&[_]usize{ @intCast(or_index - 1), @intCast(or_index), @intCast(or_index + 1) });
-            try patternArr.append(or_pattern);
-        }
-        // Parse range pattern
-        if (zstr.has(pattern, "[")) {
-            if (!zstr.has(pattern, "]")) {
-                return RegexPatternParseError.IncompleteRangePattern;
-            }
-            const left_range = zstr.find(pattern, "[");
-            const right_range = zstr.find(pattern, "]");
-            if (left_range > right_range or right_range - left_range == 1) {
-                return RegexPatternParseError.InvalidPattern;
-            }
-            try parsedIndexes.appendSlice(&[_]usize{ @intCast(left_range), @intCast(right_range) });
-            const range_str = pattern[@intCast(left_range + 1)..@intCast(right_range)];
-            debug("range string: {s}\n", .{range_str});
-            const dashes = try zstr.findAll(allocator, range_str, "-");
-            if (dashes.len == 0) {
-                for (@intCast(left_range)..@intCast(right_range + 1)) |range_index| {
-                    try parsedIndexes.append(range_index);
-                }
-                var symbols = try allocator.alloc(u8, range_str.len);
-                for (range_str, 0..) |range_literal, range_index| {
-                    symbols[range_index] = range_literal;
-                }
-                const range_pattern = Pattern{ .type = PatternType.Range, .symbols = symbols, .qualifier = '1', .startIndex = @intCast(left_range + 1) };
-                try patternArr.append(range_pattern);
-            } else {
-                var symbols = std.ArrayList(u8).init(allocator);
-                debug("dashes: ", .{});
-                for (dashes, 0..) |dash, i| {
-                    if (i == @as(usize, @intCast(dashes.len - 1))) {
-                        debug(" {c}\n", .{range_str[@intCast(dash)]});
-                        break;
-                    }
-                    debug(" {c}", .{range_str[@intCast(dash)]});
-                }
-                for (dashes, 0..) |dash, i| {
-                    if (dash == 0 or dash == range_str.len - 1) {
-                        return RegexPatternParseError.InvalidPattern;
-                    } else if (dashes.len > 1) {
-                        if (i != dashes.len - 1 and dashes[i] == dashes[i + 1] + 1) {
-                            return RegexPatternParseError.InvalidPattern;
-                        } else if (i != dashes.len - 1 and dashes[i] == dashes[i + 1] + 2) {
-                            return RegexPatternParseError.InvalidPattern;
-                        }
-                    }
-                    const lowerBound = range_str[@intCast(dash - 1)];
-                    debug("lowerBound: {c}\n", .{lowerBound});
-                    const upperBound = range_str[@intCast(dash + 1)];
-                    debug("upperBound: {c}\n", .{upperBound});
-                    if (lowerBound > upperBound) {
-                        return RegexPatternParseError.WrongLowerAndUpperBound;
-                    } else {
-                        for (lowerBound..@as(u8, @intCast(upperBound + 1))) |char_in_range| {
-                            try symbols.append(@intCast(char_in_range));
-                        }
-                        try parsedIndexes.appendSlice(&[_]usize{ @as(usize, @intCast(left_range)) + dash, @as(usize, @intCast(left_range)) + dash + 1, (@as(usize, @intCast(left_range)) + dash + 2) });
-                        //debug("parsed range literals: {c} {c} {c}\n", .{ range_str[@intCast(dash - 1)], range_str[@intCast(dash)], range_str[@intCast(dash + 1)] });
-                    }
-                }
-                debug("parsed indexes: ", .{});
-                for (parsedIndexes.items, 0..) |parsedIndex, i| {
-                    if (i == parsedIndexes.items.len - 1) {
-                        debug(" {c}\n", .{pattern[parsedIndex]});
-                    }
-                    debug(" {c}", .{pattern[parsedIndex]});
-                }
-
-                for (range_str, 0..) |range_char, i| {
-                    //if (@intCast(left_range + 1 + i))
-                    var isInParsedIndexs = false;
-                    for (parsedIndexes.items) |parsedIndex| {
-                        if (parsedIndex == @as(usize, @intCast(left_range + 1)) + i) {
-                            isInParsedIndexs = parsedIndex == @as(usize, @intCast(left_range)) + i + 1;
-                            break;
-                        }
-                    }
-                    if (!isInParsedIndexs) {
-                        try symbols.append(range_char);
-                        try parsedIndexes.append(i);
-                    }
-                }
-                const range_pattern = Pattern{ .type = PatternType.Range, .symbols = symbols.items, .qualifier = '1', .startIndex = @intCast(left_range + 1) };
-                try patternArr.append(range_pattern);
-            }
-        }
-        for (pattern, 0..) |char, i| {
-            var isInParsedIndexs = false;
-            for (parsedIndexes.items) |j| {
-                if (j == i) {
-                    isInParsedIndexs = j == i;
-                    break;
-                }
-            }
-            if (!isInParsedIndexs) {
-                var literal_symbol = try allocator.alloc(u8, 1);
-                literal_symbol[0] = char;
-                const literal_pattern = Pattern{ .type = PatternType.Literal, .symbols = literal_symbol, .qualifier = '1', .startIndex = i };
-                try patternArr.append(literal_pattern);
-            }
-        }
-
-        // order patterns - Bubble sort
-        var swapped = false;
-
-        for (0..patternArr.items.len) |i| {
-            swapped = false;
-            for (0..patternArr.items.len - i - 1) |j| {
-                if (patternArr.items[j].startIndex > patternArr.items[j + 1].startIndex) {
-                    const toBeSwapped = patternArr.items[j];
-                    patternArr.items[j] = patternArr.items[j + 1];
-                    patternArr.items[j + 1] = toBeSwapped;
-                    swapped = true;
-                }
-            }
-
-            // If no two elements were swapped, then break
-            if (!swapped)
-                break;
-        }
-
-        debug("patterns:\n", .{});
-        for (patternArr.items) |item| {
-            debug("\ttype: {}, symbols: {s}, qualifier: {c}\n", .{ item.type, item.symbols, item.qualifier });
-        }
-        return Regex{ .pattern = patternArr.items, .state = States.Qi, .pattern_index = 0, .start_index = 0 };
+    pub fn init(allocator: Allocator) Regex {
+        const inputState = InputParseState{ .current = InputState.Qi, .patternIndex = 0, .matchStartIndex = 0, .parsedStates = []InputState{} };
+        const patternState = PatternParseState{ .stack = []PatternParseState{} };
+        return Regex{ .allocator = allocator, .pattern = []Pattern{}, .state = inputState, .patternState = patternState };
     }
 
     pub fn match(self: *Self, text: []const u8) !MatchResult {
-        var result = MatchResult{ .matches = &[_]Match{} };
-        const allocator = std.heap.page_allocator;
-        var matches = std.ArrayList(Match).init(allocator);
-        for (text, 0..) |char, index| {
-            self.transition(char, index);
-            if (self.state == States.Qf) {
-                try matches.append(Match{ .text = @constCast(text[self.start_index .. index + 1]), .start = self.start_index, .length = index - self.start_index + 1 });
+        const result = MatchResult{ .matches = &[_]Match{} };
+        _ = self;
+        _ = text;
+        return result;
+    }
+
+    fn lex(self: *Self, pattern: []const u8) void {
+        var patternSymbols = std.ArrayList(SymbolValue).init(self.allocator);
+        for (pattern, 0..) |char, i| {
+            switch (char) {
+                '(' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_p, .index = i });
+                },
+                ')' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.close_p, .index = i });
+                },
+                ',' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.comma, .index = i });
+                },
+                '+' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.plus, .index = i });
+                },
+                '.' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.point, .index = i });
+                },
+                '\\' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.escape, .index = i });
+                },
+                '^' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.cap, .index = i });
+                },
+                '[' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_b, .index = i });
+                },
+                ']' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_b, .index = i });
+                },
+                '{' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_c, .index = i });
+                },
+                '}' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.close_c, .index = i });
+                },
+                '-' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.dash, .index = i });
+                },
+                '|' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.ror, .index = i });
+                },
+                '$' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.ends_w, .index = i });
+                },
+                '*' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.star, .index = i });
+                },
+                else => {
+                    if (std.ascii.isDigit(char)) {
+                        try patternSymbols.append(SymbolValue{ .type = Symbols.num, .value = char, .index = i });
+                    } else if (std.ascii.isAlphabetic(char)) {
+                        try patternSymbols.append(SymbolValue{ .type = Symbols.char, .value = char, .index = i });
+                    } else {
+                        try patternSymbols.append(SymbolValue{ .type = Symbols.lit, .value = char, .index = i });
+                    }
+                },
             }
         }
-        result.matches = matches.items;
-        return result;
+        self.patternState.symbols = patternSymbols.items;
+    }
+
+    pub fn parse(self: *Self, pattern: []const u8) !void {
+        var stack = std.ArrayList(SymbolValue).init(self.allocator);
+        var patterns = std.ArrayList(Pattern).init(self.allocator);
+        var lastValid: SymbolValue = undefined;
+        self.lex(pattern);
+        for (self.patternState.symbols.?) |symbolValue| {
+            self.patternState.step(symbolValue);
+            switch (self.patternState.current) {
+                PatternState.Valid => {
+                    lastValid = symbolValue;
+                    try stack.append(symbolValue);
+                },
+                PatternState.QualifierStart => {},
+                PatternState.NeedsEscapeChar => {},
+                PatternState.StartsWith => {},
+                PatternState.ValidWithQualifier => {},
+                PatternState.RangeStart => {},
+                PatternState.Lit => {},
+                PatternState.Dash => {},
+                PatternState.GroupStart => {},
+                PatternState.StartsWith => {},
+                PatternState.EndsWith => {},
+                PatternState.Error => {},
+            }
+        }
+        self.patterns = patterns.items;
     }
 };
 
