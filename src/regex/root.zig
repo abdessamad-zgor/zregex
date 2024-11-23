@@ -2,9 +2,6 @@ const std = @import("std");
 const zstr = @import("../str/root.zig");
 const debug = std.debug.print;
 const Allocator = std.mem.Allocator;
-// We're gonna use NFA's to parse the Regex expression
-// then register the transition which will tell use how to Parse the regex expression
-// it will give a better way to validate the regex expression and a more predictable way to generate a pattern structure
 
 pub const Match = struct { text: []u8, start: usize, length: usize };
 
@@ -18,13 +15,16 @@ const Pattern = struct { symbols: ?[][]const u8, patterns: ?[]Pattern, qualifier
 
 const PatternParseResult = struct { type: PatternType, parsed: []usize };
 
-const PatternState = enum { RangeStart, Or, Valid, ValidGroup, QualifierStart, ValidWithQualifier, ValidQualifier, ValidDashedRange, Lit, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
+const PatternState = enum { RangeStart, Or, QualifierStart, Valid, ValidGroup, ValidWithQualifier, ValidQualifier, ValidDashedRange, Lit, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
+
 const Symbols = enum { lit, char, open_p, close_p, open_b, close_b, ror, cap, ends_w, open_c, close_c, point, star, escape, plus, dash, comma, num };
+
 const SymbolValue = struct { type: Symbols, value: ?u8, index: usize };
 
 const InputState = enum { Qi, Qp, Qe, Qf };
 
 const InputParseState = struct { current: InputState, patternIndex: usize, matchStartIndex: usize };
+
 const PatternParseState = struct {
     const Self = @This();
     /// used to keep track of pattern states that influence subsequent pattern states
@@ -36,121 +36,106 @@ const PatternParseState = struct {
 
     pub fn patternStateOnSymbol(self: *Self, symbol: Symbols) void {
         self.current = switch (self.current) {
-            PatternState.Init => {
-                switch (symbol) {
-                    Symbols.lit => PatternState.Valid,
-                    Symbols.open_p => PatternState.GroupStart,
-                    Symbols.open_b => PatternState.RangeStart,
-                    Symbols.escape => PatternState.NeedsEscapeChar,
-                    Symbols.cap => PatternState.StartsWith,
-                    Symbols.point => PatternState.Valid,
-                    Symbols.num => PatternState.Valid,
-                    Symbols.char => PatternState.Valid,
-                    else => PatternState.Error,
-                }
+            PatternState.Init => switch (symbol) {
+                .lit => PatternState.Valid,
+                .open_p => PatternState.GroupStart,
+                .open_b => PatternState.RangeStart,
+                .escape => PatternState.NeedsEscapeChar,
+                .cap => PatternState.StartsWith,
+                .point => PatternState.Valid,
+                .num => PatternState.Valid,
+                .char => PatternState.Valid,
+                else => PatternState.Error,
             },
-            PatternState.StartsWith => {
-                switch (symbol) {
-                    Symbols.lit => PatternState.Valid,
-                    Symbols.num => PatternState.Valid,
-                    Symbols.char => PatternState.Valid,
-                    Symbols.open_b => PatternState.RangeStart,
-                    Symbols.open_p => PatternState.GroupStart,
-                    Symbols.escape => PatternState.NeedsEscapeChar,
-                    Symbols.point => PatternState.Valid,
-                    else => PatternState.Error,
-                }
+            PatternState.StartsWith => switch (symbol) {
+                .lit => PatternState.Valid,
+                .num => PatternState.Valid,
+                .char => PatternState.Valid,
+                .open_b => PatternState.RangeStart,
+                .open_p => PatternState.GroupStart,
+                .escape => PatternState.NeedsEscapeChar,
+                .point => PatternState.Valid,
+                else => PatternState.Error,
             },
-            PatternState.Valid => {
-                switch (symbol) {
-                    Symbols.star => PatternState.ValidWithQualifier,
-                    Symbols.plus => PatternState.ValidWithQualifier,
-                    Symbols.open_c => PatternState.QualifierStart,
-                    Symbols.open_b => blk: {
-                        break :blk PatternState.RangeStart;
-                    },
-                    Symbols.open_p => blk: {
-                        break :blk PatternState.GroupStart;
-                    },
-                    Symbols.lit => PatternState.Valid,
-                    Symbols.num => PatternState.Valid,
-                    Symbols.char => PatternState.Valid,
-                    Symbols.point => PatternState.Valid,
-                    else => PatternState.Error,
-                }
+            PatternState.Valid => switch (symbol) {
+                .star => PatternState.ValidWithQualifier,
+                .plus => PatternState.ValidWithQualifier,
+                .open_c => blk: {
+                    self.appendToStack(PatternState.QualifierStart);
+                    break :blk PatternState.QualifierStart;
+                },
+                .open_b => blk: {
+                    self.appendToStack(PatternState.RangeStart);
+                    break :blk PatternState.RangeStart;
+                },
+                .open_p => blk: {
+                    self.appendToStack(PatternState.GroupStart);
+                    break :blk PatternState.GroupStart;
+                },
+                .lit => PatternState.Valid,
+                .num => PatternState.Valid,
+                .char => PatternState.Valid,
+                .point => PatternState.Valid,
+                else => PatternState.Error,
             },
-            PatternState.ValidWithQualifier => {
-                switch (symbol) {
-                    Symbols.lit => PatternState.Valid,
-                    Symbols.num => PatternState.Valid,
-                    Symbols.char => PatternState.Valid,
-                    Symbols.open_b => PatternState.RangeStart,
-                    Symbols.open_p => PatternState.GroupStart,
-                    else => PatternState.Error,
-                }
+            PatternState.ValidWithQualifier => switch (symbol) {
+                .lit => PatternState.Valid,
+                .num => PatternState.Valid,
+                .char => PatternState.Valid,
+                .open_b => PatternState.RangeStart,
+                .open_p => PatternState.GroupStart,
+                else => PatternState.Error,
             },
-            PatternState.QualifierStart => {
-                switch (symbol) {
-                    Symbols.num => PatternState.ValidQualifier,
-                    Symbols.comma => PatternState.ValidQualifier,
-                    Symbols.close_c => PatternState.ValidWithQualifier,
-                    else => PatternState.Error,
-                }
+            PatternState.QualifierStart => switch (symbol) {
+                .num => PatternState.ValidQualifier,
+                .comma => PatternState.ValidQualifier,
+                .close_c => PatternState.ValidWithQualifier,
+                else => PatternState.Error,
             },
-            PatternState.GroupStart => {
-                switch (symbol) {
-                    Symbols.num => blk: {
-                        self.appendToStack(self.current);
-                        break :blk PatternState.ValidGroup;
-                    },
-                    Symbols.char => blk: {
-                        self.appendToStack(self.current);
-                        break :blk PatternState.ValidGroup;
-                    },
-                    Symbols.lit => blk: {
-                        self.appendToStack(self.current);
-                        break :blk PatternState.ValidGroup;
-                    },
-                    Symbols.escape => PatternState.NeedsEscapeChar,
-                    else => PatternState.Error,
-                }
+            PatternState.GroupStart => switch (symbol) {
+                .num => blk: {
+                    self.appendToStack(self.current);
+                    break :blk PatternState.ValidGroup;
+                },
+                .char => blk: {
+                    self.appendToStack(self.current);
+                    break :blk PatternState.ValidGroup;
+                },
+                .lit => blk: {
+                    self.appendToStack(self.current);
+                    break :blk PatternState.ValidGroup;
+                },
+                .escape => PatternState.NeedsEscapeChar,
+                else => PatternState.Error,
             },
-            PatternState.RangeStart => {
-                switch (symbol) {
-                    Symbols.num => PatternState.ValidRange,
-                    Symbols.char => PatternState.ValidRange,
-                    Symbols.lit => PatternState.ValidRange,
-                    Symbols.escape => PatternState.NeedsEscapeChar,
-                    else => PatternState.Error,
-                }
+            PatternState.RangeStart => switch (symbol) {
+                .num => PatternState.ValidRange,
+                .char => PatternState.ValidRange,
+                .lit => PatternState.ValidRange,
+                .escape => PatternState.NeedsEscapeChar,
+                else => PatternState.Error,
             },
-            PatternState.ValidRange => {
-                switch (symbol) {
-                    Symbols.num => PatternState.ValidRange,
-                    Symbols.char => PatternState.ValidRange,
-                    Symbols.lit => PatternState.ValidRange,
-                    Symbols.dash => PatternState.Dash,
-                    Symbols.close_b => PatternState.Valid,
-                    Symbols.escape => PatternState.NeedsEscapeChar,
-                    else => PatternState.Error,
-                }
+            PatternState.ValidRange => switch (symbol) {
+                .num => PatternState.ValidRange,
+                .char => PatternState.ValidRange,
+                .lit => PatternState.ValidRange,
+                .dash => PatternState.Dash,
+                .close_b => PatternState.Valid,
+                .escape => PatternState.NeedsEscapeChar,
+                else => PatternState.Error,
             },
-            PatternState.Dash => {
-                switch (symbol) {
-                    Symbols.num => PatternState.ValidDashedRange,
-                    Symbols.char => PatternState.ValidDashedRange,
-                    Symbols.lit => PatternState.ValidDashedRange,
-                    else => PatternState.Error,
-                }
+            PatternState.Dash => switch (symbol) {
+                .num => PatternState.ValidDashedRange,
+                .char => PatternState.ValidDashedRange,
+                .lit => PatternState.ValidDashedRange,
+                else => PatternState.Error,
             },
-            PatternState.ValidDashedRange => {
-                switch (symbol) {
-                    Symbols.num => PatternState.ValidRange,
-                    Symbols.char => PatternState.ValidRange,
-                    Symbols.lit => PatternState.ValidRange,
-                    Symbols.close_b => PatternState.Valid,
-                    else => PatternState.Error,
-                }
+            PatternState.ValidDashedRange => switch (symbol) {
+                .num => PatternState.ValidRange,
+                .char => PatternState.ValidRange,
+                .lit => PatternState.ValidRange,
+                .close_b => PatternState.Valid,
+                else => PatternState.Error,
             },
             PatternState.NeedsEscapeChar => blk: {
                 const reducedStackState = self.reduceStack();
@@ -164,13 +149,11 @@ const PatternParseState = struct {
                     };
                 }
             },
-            PatternState.ValidGroup => {
-                switch (symbol) {
-                    Symbols.close_p => blk: {
-                        self.emptyStack();
-                        break :blk PatternState.Valid;
-                    },
-                }
+            PatternState.ValidGroup => switch (symbol) {
+                .close_p => blk: {
+                    self.emptyStack();
+                    break :blk PatternState.Valid;
+                },
             },
         };
     }
@@ -387,18 +370,33 @@ pub const Regex = struct {
                     try stack.append(symbolValue);
                 },
                 PatternState.ValidWithQualifier => {
-                    lastValid = undefined;
+                    lastValid = null;
+                    try stack.append(symbolValue);
+                    const parsedPattern = self.buildPattern(stack.items);
+                    try patterns.append(parsedPattern);
+                    try stack.resize(0);
                 },
                 PatternState.Error => {},
                 else => {
                     // check if pattern was valid before current symbol
-                    if (lastValid != null and lastValid.?.index == symbolValue.index - 1) {} else {
+                    if (lastValid != null and lastValid.?.index == symbolValue.index - 1) {
+                        const parsedPattern = self.buildPattern(stack.items);
+                        try patterns.append(parsedPattern);
+                        try stack.resize(0);
+                        lastValid = null;
+                    } else {
                         try stack.append(symbolValue);
                     }
                 },
             }
         }
         self.patterns = patterns.items;
+    }
+
+    fn buildPattern(self: *Self, symbols: []SymbolValue) Pattern {
+        _ = self;
+        _ = symbols;
+        return Pattern{ .type = PatternType.Or, .qualifier = '1', .startIndex = 0 };
     }
 };
 
