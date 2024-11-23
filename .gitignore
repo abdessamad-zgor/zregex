@@ -1,3 +1,4 @@
 .zig-cache/
-./main.o
-./main
+main.o
+main
+src/util/**

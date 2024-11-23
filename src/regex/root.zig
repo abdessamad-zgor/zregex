@@ -18,7 +18,7 @@ const Pattern = struct { symbols: ?[][]const u8, patterns: ?[]Pattern, qualifier
 
 const PatternParseResult = struct { type: PatternType, parsed: []usize };
 
-const PatternState = enum { RangeStart, Valid, QualifierStart, ValidWithQualifier, ValidQualifier, Lit, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
+const PatternState = enum { RangeStart, Or, Valid, ValidGroup, QualifierStart, ValidWithQualifier, ValidQualifier, ValidDashedRange, Lit, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
 const Symbols = enum { lit, char, open_p, close_p, open_b, close_b, ror, cap, ends_w, open_c, close_c, point, star, escape, plus, dash, comma, num };
 const SymbolValue = struct { type: Symbols, value: ?u8, index: usize };
 
@@ -27,33 +27,30 @@ const InputState = enum { Qi, Qp, Qe, Qf };
 const InputParseState = struct { current: InputState, patternIndex: usize, matchStartIndex: usize };
 const PatternParseState = struct {
     const Self = @This();
-    /// the stack represents the symbols the belong to a multi charachter construct (i.e groups, altenatives, qualifiers, ..etc)
-    stack: []SymbolValue,
+    /// used to keep track of pattern states that influence subsequent pattern states
+    patternStateStack: ?[]PatternState,
     /// meaningful characters inside a regex pattern
     symbols: ?[]SymbolValue,
     parsedSymbols: ?[]SymbolValue,
     current: PatternState,
-    fn step(self: *Self, symbol: SymbolValue) void {
-        self.current = self.patternStateOnSymbol(symbol.type);
-    }
 
-    fn patternStateOnSymbol(self: *Self, symbol: Symbols) PatternState {
-        switch (self.current) {
+    pub fn patternStateOnSymbol(self: *Self, symbol: Symbols) void {
+        self.current = switch (self.current) {
             PatternState.Init => {
-                return switch (symbol) {
+                switch (symbol) {
                     Symbols.lit => PatternState.Valid,
                     Symbols.open_p => PatternState.GroupStart,
                     Symbols.open_b => PatternState.RangeStart,
                     Symbols.escape => PatternState.NeedsEscapeChar,
                     Symbols.cap => PatternState.StartsWith,
-                    Symbols.point => PatternState.AnyChar,
+                    Symbols.point => PatternState.Valid,
                     Symbols.num => PatternState.Valid,
                     Symbols.char => PatternState.Valid,
                     else => PatternState.Error,
-                };
+                }
             },
             PatternState.StartsWith => {
-                return switch (symbol) {
+                switch (symbol) {
                     Symbols.lit => PatternState.Valid,
                     Symbols.num => PatternState.Valid,
                     Symbols.char => PatternState.Valid,
@@ -62,38 +59,205 @@ const PatternParseState = struct {
                     Symbols.escape => PatternState.NeedsEscapeChar,
                     Symbols.point => PatternState.Valid,
                     else => PatternState.Error,
-                };
+                }
             },
             PatternState.Valid => {
-                return switch (symbol) {
+                switch (symbol) {
                     Symbols.star => PatternState.ValidWithQualifier,
                     Symbols.plus => PatternState.ValidWithQualifier,
                     Symbols.open_c => PatternState.QualifierStart,
-                    Symbols.open_b => PatternState.RangeStart,
-                    Symbols.open_p => PatternState.GroupStart,
+                    Symbols.open_b => blk: {
+                        break :blk PatternState.RangeStart;
+                    },
+                    Symbols.open_p => blk: {
+                        break :blk PatternState.GroupStart;
+                    },
                     Symbols.lit => PatternState.Valid,
                     Symbols.num => PatternState.Valid,
                     Symbols.char => PatternState.Valid,
                     Symbols.point => PatternState.Valid,
                     else => PatternState.Error,
-                };
+                }
             },
             PatternState.ValidWithQualifier => {
-                return switch (symbol) {
+                switch (symbol) {
                     Symbols.lit => PatternState.Valid,
                     Symbols.num => PatternState.Valid,
                     Symbols.char => PatternState.Valid,
                     Symbols.open_b => PatternState.RangeStart,
                     Symbols.open_p => PatternState.GroupStart,
                     else => PatternState.Error,
-                };
+                }
             },
             PatternState.QualifierStart => {
-                return switch (symbol) {
+                switch (symbol) {
                     Symbols.num => PatternState.ValidQualifier,
+                    Symbols.comma => PatternState.ValidQualifier,
+                    Symbols.close_c => PatternState.ValidWithQualifier,
                     else => PatternState.Error,
-                };
+                }
             },
+            PatternState.GroupStart => {
+                switch (symbol) {
+                    Symbols.num => blk: {
+                        self.appendToStack(self.current);
+                        break :blk PatternState.ValidGroup;
+                    },
+                    Symbols.char => blk: {
+                        self.appendToStack(self.current);
+                        break :blk PatternState.ValidGroup;
+                    },
+                    Symbols.lit => blk: {
+                        self.appendToStack(self.current);
+                        break :blk PatternState.ValidGroup;
+                    },
+                    Symbols.escape => PatternState.NeedsEscapeChar,
+                    else => PatternState.Error,
+                }
+            },
+            PatternState.RangeStart => {
+                switch (symbol) {
+                    Symbols.num => PatternState.ValidRange,
+                    Symbols.char => PatternState.ValidRange,
+                    Symbols.lit => PatternState.ValidRange,
+                    Symbols.escape => PatternState.NeedsEscapeChar,
+                    else => PatternState.Error,
+                }
+            },
+            PatternState.ValidRange => {
+                switch (symbol) {
+                    Symbols.num => PatternState.ValidRange,
+                    Symbols.char => PatternState.ValidRange,
+                    Symbols.lit => PatternState.ValidRange,
+                    Symbols.dash => PatternState.Dash,
+                    Symbols.close_b => PatternState.Valid,
+                    Symbols.escape => PatternState.NeedsEscapeChar,
+                    else => PatternState.Error,
+                }
+            },
+            PatternState.Dash => {
+                switch (symbol) {
+                    Symbols.num => PatternState.ValidDashedRange,
+                    Symbols.char => PatternState.ValidDashedRange,
+                    Symbols.lit => PatternState.ValidDashedRange,
+                    else => PatternState.Error,
+                }
+            },
+            PatternState.ValidDashedRange => {
+                switch (symbol) {
+                    Symbols.num => PatternState.ValidRange,
+                    Symbols.char => PatternState.ValidRange,
+                    Symbols.lit => PatternState.ValidRange,
+                    Symbols.close_b => PatternState.Valid,
+                    else => PatternState.Error,
+                }
+            },
+            PatternState.NeedsEscapeChar => blk: {
+                const reducedStackState = self.reduceStack();
+                if (reducedStackState == null) {
+                    break :blk PatternState.Valid;
+                } else {
+                    break :blk switch (reducedStackState.?) {
+                        PatternState.GroupStart => PatternState.ValidGroup,
+                        PatternState.RangeStart => PatternState.ValidRange,
+                        else => PatternState.Valid,
+                    };
+                }
+            },
+            PatternState.ValidGroup => {
+                switch (symbol) {
+                    Symbols.close_p => blk: {
+                        self.emptyStack();
+                        break :blk PatternState.Valid;
+                    },
+                }
+            },
+        };
+    }
+
+    fn appendToStack(self: *Self, state: PatternState) void {
+        const stack = self.nestedSymbolStack.? orelse return &[_]PatternState{};
+        const stackLen = stack.len;
+        const patternStateStack: [stackLen + 1]PatternState = undefined;
+        for (stack, 0..) |value, i| {
+            patternStateStack[i] = value;
+        }
+        patternStateStack[stackLen - 1] = state;
+        self.patternStateStack = patternStateStack;
+    }
+
+    fn emptyStack(self: *Self) void {
+        self.patternStateStack = null;
+    }
+
+    fn popStack(self: *Self) ?PatternState {
+        const stack = self.nestedSymbolStack.? orelse return &[_]PatternState{};
+        const stackLen = stack.len;
+        if (stackLen == 0) {
+            return null;
+        } else if (stackLen == 1) {
+            const lastElement = stack[0];
+            self.patternStateStack = null;
+            return lastElement;
+        } else {
+            const lastElement = stack[stackLen - 1];
+            const poppedStack = stack[0 .. stackLen - 1];
+            self.patternStateStack = poppedStack;
+            return lastElement;
+        }
+    }
+
+    fn getLast(self: *Self) ?PatternState {
+        const stack = self.nestedSymbolStack.? orelse return &[_]PatternState{};
+        const stackLen = stack.len;
+        if (stackLen == 0) {
+            return null;
+        } else {
+            const lastElement = stack[stackLen - 1];
+            return lastElement;
+        }
+    }
+
+    fn reduceStack(self: *Self) ?PatternState {
+        const stack = self.nestedSymbolStack.? orelse return &[_]PatternState{};
+        const stackLen = stack.len;
+        if (stackLen == 0) {
+            return null;
+        } else {
+            // only the latest RangeStart and GroupRange are considered in this case
+            var acc: ?PatternState = stack[stackLen - 1];
+            for (0..stackLen - 1) |i| {
+                acc = switch (stack[@intCast(stackLen - 2 - i)]) {
+                    PatternState.RangeStart => blk: {
+                        break :blk PatternState.RangeStart;
+                    },
+                    PatternState.GroupStart => blk: {
+                        break :blk PatternState.GroupStart;
+                    },
+                    else => acc,
+                };
+            }
+            return switch (acc) {
+                PatternState.RangeStart => PatternState.RangeStart,
+                PatternState.GroupStart => PatternState.GroupStart,
+                else => null,
+            };
+        }
+    }
+
+    fn printPatternParseState(self: *Self) void {
+        debug("pattern parse state: \n\tcurrent: {}\n", .{self.current});
+        if (self.patternStateStack != null) {
+            debug("\tstack: [", .{});
+            for (self.patternStateStack.?, 0..) |patternState, i| {
+                if (i == self.patternStateStack.?.len) {
+                    debug("{}]\n", .{patternState});
+                    break;
+                }
+                debug("{}, ", .{patternState});
+            }
+        } else {
+            debug("\tstack: []\n", .{});
         }
     }
 };
@@ -212,27 +376,26 @@ pub const Regex = struct {
 
     pub fn parse(self: *Self, pattern: []const u8) !void {
         var stack = std.ArrayList(SymbolValue).init(self.allocator);
-        var patterns = std.ArrayList(Pattern).init(self.allocator);
-        var lastValid: SymbolValue = undefined;
+        const patterns = std.ArrayList(Pattern).init(self.allocator);
+        var lastValid: ?SymbolValue = null;
         self.lex(pattern);
         for (self.patternState.symbols.?) |symbolValue| {
-            self.patternState.step(symbolValue);
+            self.patternState.patternStateOnSymbol(symbolValue.type);
             switch (self.patternState.current) {
                 PatternState.Valid => {
                     lastValid = symbolValue;
                     try stack.append(symbolValue);
                 },
-                PatternState.QualifierStart => {},
-                PatternState.NeedsEscapeChar => {},
-                PatternState.StartsWith => {},
-                PatternState.ValidWithQualifier => {},
-                PatternState.RangeStart => {},
-                PatternState.Lit => {},
-                PatternState.Dash => {},
-                PatternState.GroupStart => {},
-                PatternState.StartsWith => {},
-                PatternState.EndsWith => {},
+                PatternState.ValidWithQualifier => {
+                    lastValid = undefined;
+                },
                 PatternState.Error => {},
+                else => {
+                    // check if pattern was valid before current symbol
+                    if (lastValid != null and lastValid.?.index == symbolValue.index - 1) {} else {
+                        try stack.append(symbolValue);
+                    }
+                },
             }
         }
         self.patterns = patterns.items;
