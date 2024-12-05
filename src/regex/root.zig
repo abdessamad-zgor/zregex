@@ -34,6 +34,69 @@ const PatternParseState = struct {
         return PatternParseState{ .patternStateStack = &[_]PatternState{}, .symbols = null, .current = .Init, .allocator = allocator, .patternHistory = &[_]PatternState{} };
     }
 
+    fn lex(self: *Self, pattern: []const u8) !void {
+        var patternSymbols = std.ArrayList(SymbolValue).init(self.allocator);
+        for (pattern, 0..) |char, i| {
+            switch (char) {
+                '(' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_p, .index = i, .value = null });
+                },
+                ')' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.close_p, .index = i, .value = null });
+                },
+                ',' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.comma, .index = i, .value = null });
+                },
+                '+' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.plus, .index = i, .value = null });
+                },
+                '.' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.point, .index = i, .value = null });
+                },
+                92 => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.escape, .index = i, .value = null });
+                },
+                '^' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.cap, .index = i, .value = null });
+                },
+                '[' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_b, .index = i, .value = null });
+                },
+                ']' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_b, .index = i, .value = null });
+                },
+                '{' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_c, .index = i, .value = null });
+                },
+                '}' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.close_c, .index = i, .value = null });
+                },
+                '-' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.dash, .index = i, .value = null });
+                },
+                '|' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.ror, .index = i, .value = null });
+                },
+                '$' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.ends_w, .index = i, .value = null });
+                },
+                '*' => {
+                    try patternSymbols.append(SymbolValue{ .type = Symbols.star, .index = i, .value = null });
+                },
+                else => {
+                    if (std.ascii.isDigit(char)) {
+                        try patternSymbols.append(SymbolValue{ .type = Symbols.num, .value = char, .index = i });
+                    } else if (std.ascii.isAlphabetic(char)) {
+                        try patternSymbols.append(SymbolValue{ .type = Symbols.char, .value = char, .index = i });
+                    } else {
+                        try patternSymbols.append(SymbolValue{ .type = Symbols.lit, .value = char, .index = i });
+                    }
+                },
+            }
+        }
+        self.symbols = patternSymbols.items;
+    }
+
     // TODO: exhaustive list of cases ( Or, EndsWith)
     pub fn patternStateOnSymbol(self: *Self, symbol: Symbols) !void {
         if (self.current != .Init) {
@@ -132,10 +195,10 @@ const PatternParseState = struct {
                 .dash => .Dash,
                 .escape => .NeedsEscapeChar,
                 .close_b => blk: {
-                    const openState = self.findStackState(PatternState.RangeStart);
+                    const openState = self.findStackState(.RangeStart);
                     if (openState == 0) {
                         self.emptyStack(openState);
-                        break :blk PatternState.Valid;
+                        break :blk .Valid;
                     } else {
                         self.emptyStack(openState);
                         const nestedConstructState = self.reduceStack();
@@ -167,11 +230,11 @@ const PatternParseState = struct {
             },
             .ValidGroup => switch (symbol) {
                 .close_p => blk: {
-                    const openState = self.findStackState(PatternState.GroupStart);
+                    const openState = self.findStackState(.GroupStart);
                     std.debug.assert(openState != null);
                     if (openState.? == 0) {
                         self.emptyStack(openState);
-                        break :blk PatternState.Valid;
+                        break :blk .Valid;
                     } else {
                         self.emptyStack(openState);
                         const reducedStackState = self.reduceStack();
@@ -279,9 +342,17 @@ const PatternParseState = struct {
                 .num => .ValidQualifier,
                 else => .Error,
             },
-            .EndsWith => switch (symbol) {},
-            .Error => switch (symbol) {},
+            .EndsWith => .Error,
+            .Error => .Error,
         };
+    }
+
+    fn walk(self: *Self) !void {
+        for (self.symbols.?) |symbol| {
+            try self.patternStateOnSymbol(symbol);
+            //self.printPatternParseState();
+        }
+        //self.printPatternParseState();
     }
 
     fn appendToHistory(self: *Self, state: PatternState) !void {
@@ -477,111 +548,49 @@ pub const Regex = struct {
         return result;
     }
 
-    fn lex(self: *Self, pattern: []const u8) !void {
-        var patternSymbols = std.ArrayList(SymbolValue).init(self.allocator);
-        for (pattern, 0..) |char, i| {
-            switch (char) {
-                '(' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_p, .index = i, .value = null });
-                },
-                ')' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.close_p, .index = i, .value = null });
-                },
-                ',' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.comma, .index = i, .value = null });
-                },
-                '+' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.plus, .index = i, .value = null });
-                },
-                '.' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.point, .index = i, .value = null });
-                },
-                92 => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.escape, .index = i, .value = null });
-                },
-                '^' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.cap, .index = i, .value = null });
-                },
-                '[' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_b, .index = i, .value = null });
-                },
-                ']' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_b, .index = i, .value = null });
-                },
-                '{' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.open_c, .index = i, .value = null });
-                },
-                '}' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.close_c, .index = i, .value = null });
-                },
-                '-' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.dash, .index = i, .value = null });
-                },
-                '|' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.ror, .index = i, .value = null });
-                },
-                '$' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.ends_w, .index = i, .value = null });
-                },
-                '*' => {
-                    try patternSymbols.append(SymbolValue{ .type = Symbols.star, .index = i, .value = null });
-                },
-                else => {
-                    if (std.ascii.isDigit(char)) {
-                        try patternSymbols.append(SymbolValue{ .type = Symbols.num, .value = char, .index = i });
-                    } else if (std.ascii.isAlphabetic(char)) {
-                        try patternSymbols.append(SymbolValue{ .type = Symbols.char, .value = char, .index = i });
-                    } else {
-                        try patternSymbols.append(SymbolValue{ .type = Symbols.lit, .value = char, .index = i });
-                    }
-                },
-            }
-        }
-        self.patternState.symbols = patternSymbols.items;
-    }
-
     ///Compile regular expression
     pub fn compile(self: *Self, pattern: []const u8) !void {
         var stack = std.ArrayList(SymbolValue).init(self.allocator);
         var patterns = std.ArrayList(Pattern).init(self.allocator);
+        var states = std.ArrayList(PatternState).init(self.allocator);
         var lastValid: ?SymbolValue = null;
-        try self.lex(pattern);
-        for (self.patternState.symbols.?) |symbolValue| {
-            try self.patternState.patternStateOnSymbol(symbolValue.type);
-            switch (self.patternState.current) {
-                PatternState.Valid => {
-                    lastValid = symbolValue;
-                    try stack.append(symbolValue);
-                },
-                PatternState.ValidWithQualifier => {
-                    lastValid = null;
-                    try stack.append(symbolValue);
-                    const parsedPattern = self.buildPattern(stack.items);
-                    try patterns.append(@as(Pattern, parsedPattern));
-                    try stack.resize(0);
-                },
-                PatternState.Or => {
-                    lastValid = null;
-                    try stack.append(symbolValue);
-                    const parsedPattern = self.buildPattern(stack.items);
-                    try patterns.append(@as(Pattern, parsedPattern));
-                    try stack.resize(0);
-                },
-                PatternState.Error => {},
-                else => {
-                    // check if pattern was valid before current symbol
-                    if (lastValid != null and lastValid.?.index == symbolValue.index - 1) {
-                        const parsedPattern = self.buildPattern(stack.items);
-                        try patterns.append(parsedPattern);
-                        try stack.resize(0);
+        try self.patternState.lex(pattern);
+        try self.patternState.walk();
+        try states.appendSlice(self.patternState.patternHistory);
+        try states.append(self.patternState.current);
+
+        if (self.patternState.current == .Valid or self.patternState.current == .ValidWithQualifier) {
+            for (states.items, 0..) |state, i| {
+                switch (state) {
+                    .Valid => blk: {
+                        lastValid = self.patternState.symbols.?[i];
+                        break :blk;
+                    },
+                    .ValidWithQualifier => blk: {
+                        const stateSymbol = self.patternState.symbols.?[i];
                         lastValid = null;
-                    } else {
-                        try stack.append(symbolValue);
-                    }
-                },
+                        try stack.append(stateSymbol);
+                        const builtPattern = self.buildPattern(stack.items);
+                        try patterns.append(builtPattern);
+                        break :blk;
+                    },
+                    .QualifierStart => blk: {
+                        try stack.append(self.patternState.symbols.?[i]);
+                        break :blk;
+                    },
+                    .ValidQualifier => blk: {
+                        try stack.append(self.patternState.symbols.?[i]);
+                        break :blk;
+                    },
+                    else => {
+                        try stack.append(state);
+                    },
+                }
             }
+        } else {
+            return RegexPatternParseError.InvalidPattern;
         }
-        self.patternState.printPatternParseState();
+
         self.patterns = patterns.items;
     }
 
