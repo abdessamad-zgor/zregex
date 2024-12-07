@@ -1,4 +1,3 @@
 .zig-cache/
 main.o
 main
-src/util/**

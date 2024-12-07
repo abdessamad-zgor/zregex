@@ -1,5 +1,5 @@
 const std = @import("std");
-const zstr = @import("../str/root.zig");
+const util = @import("./util.zig");
 const debug = std.debug.print;
 const Allocator = std.mem.Allocator;
 
@@ -9,9 +9,9 @@ pub const MatchResult = struct {
     matches: []Match,
 };
 
-const PatternType = enum { Or, Literal, ExclusiveRange, Range, Group };
+const PatternType = enum { Or, Literal, ExclusiveRange, Range, Group, Empty };
 
-const Pattern = struct { symbols: ?[][]const u8, patterns: ?[]Pattern, qualifier: u8, type: PatternType, startIndex: usize };
+const Pattern = struct { symbols: ?[]const u8 = null, patterns: ?[]Pattern = null, qualifier: u8 = '1', type: PatternType = .Empty, startIndex: usize = 0 };
 
 const PatternParseResult = struct { type: PatternType, parsed: []usize };
 const PatternState = enum { RangeStart, Or, QualifierStart, Valid, ValidGroup, ValidWithQualifier, ValidQualifier, ValidDashedRange, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
@@ -245,49 +245,7 @@ const PatternParseState = struct {
                         }
                     }
                 },
-                .ror => switch (symbol) {
-                    .num => blk: {
-                        const nestedPatternState = self.reduceStack();
-                        if (nestedPatternState == null) {
-                            break :blk .Valid;
-                        } else {
-                            break :blk nestedPatternState.?;
-                        }
-                    },
-                    .lit => blk: {
-                        const nestedPatternState = self.reduceStack();
-                        if (nestedPatternState == null) {
-                            break :blk .Valid;
-                        } else {
-                            break :blk nestedPatternState.?;
-                        }
-                    },
-                    .char => blk: {
-                        const nestedPatternState = self.reduceStack();
-                        if (nestedPatternState == null) {
-                            break :blk .Valid;
-                        } else {
-                            break :blk nestedPatternState.?;
-                        }
-                    },
-                    .close_b => blk: {
-                        const nestedPatternState = self.reduceStack();
-                        if (nestedPatternState == null) {
-                            break :blk .Valid;
-                        } else {
-                            break :blk nestedPatternState.?;
-                        }
-                    },
-                    .close_p => blk: {
-                        const nestedPatternState = self.reduceStack();
-                        if (nestedPatternState == null) {
-                            break :blk .Valid;
-                        } else {
-                            break :blk nestedPatternState.?;
-                        }
-                    },
-                    else => .Error,
-                },
+                .ror => .Or,
                 .escape => .NeedsEscapeChar,
                 .num => .ValidGroup,
                 .char => .ValidGroup,
@@ -295,7 +253,7 @@ const PatternParseState = struct {
                 else => .Error,
             },
             .Or => switch (symbol) {
-                .p_close => blk: {
+                .close_p => blk: {
                     const nestedPatternState = self.reduceStack();
                     if (nestedPatternState == null) {
                         break :blk .Valid;
@@ -349,10 +307,10 @@ const PatternParseState = struct {
 
     fn walk(self: *Self) !void {
         for (self.symbols.?) |symbol| {
-            try self.patternStateOnSymbol(symbol);
+            try self.patternStateOnSymbol(symbol.type);
             //self.printPatternParseState();
         }
-        //self.printPatternParseState();
+        self.printPatternParseState();
     }
 
     fn appendToHistory(self: *Self, state: PatternState) !void {
@@ -570,8 +528,9 @@ pub const Regex = struct {
                         const stateSymbol = self.patternState.symbols.?[i];
                         lastValid = null;
                         try stack.append(stateSymbol);
-                        const builtPattern = self.buildPattern(stack.items);
+                        const builtPattern = try self.buildPattern(stack.items);
                         try patterns.append(builtPattern);
+                        try stack.resize(0);
                         break :blk;
                     },
                     .QualifierStart => blk: {
@@ -583,7 +542,7 @@ pub const Regex = struct {
                         break :blk;
                     },
                     else => {
-                        try stack.append(state);
+                        try stack.append(self.patternState.symbols.?[i]);
                     },
                 }
             }
@@ -594,10 +553,103 @@ pub const Regex = struct {
         self.patterns = patterns.items;
     }
 
-    fn buildPattern(self: *Self, symbols: []SymbolValue) Pattern {
-        _ = self;
-        _ = symbols;
-        return Pattern{ .type = PatternType.Or, .qualifier = '1', .startIndex = 0, .symbols = null, .patterns = null };
+    fn buildPattern(self: *Self, symbols: []SymbolValue) !Pattern {
+        const PatternStackEntry = struct { current: Pattern, nested: ?std.ArrayList(Pattern) = null };
+        var patternStack = util.Stack(PatternStackEntry).init(self.allocator);
+        var nestedPatterns = std.ArrayList(Pattern).init(self.allocator);
+        var current = Pattern{};
+        for (symbols) |symbol| {
+            switch (symbol.type) {
+                Symbols.open_p => blk: {
+                    switch (current.type) {
+                        .Empty => iblk: {
+                            current.type = PatternType.Group;
+                            current.startIndex = symbol.index;
+                            break :iblk;
+                        },
+                        .Group => iblk: {
+                            try patternStack.push(PatternStackEntry{ .current = current, .nested = nestedPatterns });
+                            break :iblk;
+                        },
+                        else => unreachable,
+                    }
+                    break :blk;
+                },
+                Symbols.close_p => blk: {
+                    switch (current.type) {
+                        .Group => iblk: {
+                            if (!patternStack.isEmpty()) {
+                                var parentPattern = patternStack.pop();
+                                try parentPattern.nested.?.append(current);
+                                nestedPatterns = parentPattern.nested.?;
+                                current = parentPattern.current;
+                            }
+                            break :iblk;
+                        },
+                        else => unreachable,
+                    }
+                    break :blk;
+                },
+                Symbols.num => blk: {
+                    switch (current.type) {
+                        .Group => iblk: {
+                            if (!patternStack.isEmpty()) {
+                                try nestedPatterns.append(Pattern{});
+                            }
+                            break :iblk;
+                        },
+                        else => unreachable,
+                    }
+                    break :blk;
+                },
+                Symbols.char => blk: {
+                    break :blk;
+                },
+                Symbols.lit => blk: {
+                    break :blk;
+                },
+                Symbols.ror => blk: {
+                    break :blk;
+                },
+                Symbols.cap => blk: {
+                    break :blk;
+                },
+                Symbols.open_c => blk: {
+                    break :blk;
+                },
+                Symbols.close_c => blk: {
+                    break :blk;
+                },
+                Symbols.open_b => blk: {
+                    break :blk;
+                },
+                Symbols.close_b => blk: {
+                    break :blk;
+                },
+                Symbols.star => blk: {
+                    break :blk;
+                },
+                Symbols.plus => blk: {
+                    break :blk;
+                },
+                Symbols.dash => blk: {
+                    break :blk;
+                },
+                Symbols.point => blk: {
+                    break :blk;
+                },
+                Symbols.escape => blk: {
+                    break :blk;
+                },
+                Symbols.comma => blk: {
+                    break :blk;
+                },
+                else => blk: {
+                    break :blk;
+                },
+            }
+        }
+        return current;
     }
 
     fn buildPatternTree(self: *Self, patterns: []Pattern) []Pattern {
