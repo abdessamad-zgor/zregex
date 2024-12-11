@@ -201,7 +201,7 @@ const PatternParseState = struct {
                         break :blk .Valid;
                     } else {
                         self.emptyStack(openState);
-                        const nestedConstructState = self.reduceStack();
+                        const nestedConstructState = self.getParentState();
                         break :blk nestedConstructState.?;
                     }
                 },
@@ -221,7 +221,8 @@ const PatternParseState = struct {
                 else => .Error,
             },
             .NeedsEscapeChar => blk: {
-                const reducedStackState = self.reduceStack();
+                const reducedStackState = self.getParentState();
+                debug("reducedState: {?}\n", .{reducedStackState});
                 if (reducedStackState == null) {
                     break :blk .Valid;
                 } else {
@@ -237,7 +238,7 @@ const PatternParseState = struct {
                         break :blk .Valid;
                     } else {
                         self.emptyStack(openState);
-                        const reducedStackState = self.reduceStack();
+                        const reducedStackState = self.getParentState();
                         if (reducedStackState == null) {
                             break :blk .Valid;
                         } else {
@@ -254,7 +255,7 @@ const PatternParseState = struct {
             },
             .Or => switch (symbol) {
                 .close_p => blk: {
-                    const nestedPatternState = self.reduceStack();
+                    const nestedPatternState = self.getParentState();
                     if (nestedPatternState == null) {
                         break :blk .Valid;
                     } else {
@@ -262,7 +263,7 @@ const PatternParseState = struct {
                     }
                 },
                 .num => blk: {
-                    const nestedPatternState = self.reduceStack();
+                    const nestedPatternState = self.getParentState();
                     if (nestedPatternState == null) {
                         break :blk .Valid;
                     } else {
@@ -270,7 +271,7 @@ const PatternParseState = struct {
                     }
                 },
                 .char => blk: {
-                    const nestedPatternState = self.reduceStack();
+                    const nestedPatternState = self.getParentState();
                     if (nestedPatternState == null) {
                         break :blk .Valid;
                     } else {
@@ -278,7 +279,7 @@ const PatternParseState = struct {
                     }
                 },
                 .lit => blk: {
-                    const nestedPatternState = self.reduceStack();
+                    const nestedPatternState = self.getParentState();
                     if (nestedPatternState == null) {
                         break :blk .Valid;
                     } else {
@@ -290,7 +291,7 @@ const PatternParseState = struct {
             },
             .ValidQualifier => switch (symbol) {
                 .close_c => blk: {
-                    const nestedPatternState = self.reduceStack();
+                    const nestedPatternState = self.getParentState();
                     if (nestedPatternState == null) {
                         break :blk .Valid;
                     } else {
@@ -375,7 +376,7 @@ const PatternParseState = struct {
         }
     }
 
-    fn reduceStack(self: *Self) ?PatternState {
+    fn getParentState(self: *Self) ?PatternState {
         const stack = self.patternStateStack orelse &[_]PatternState{};
         const stackLen = stack.len;
         if (stackLen == 0) {
@@ -384,9 +385,9 @@ const PatternParseState = struct {
             // only the latest RangeStart and GroupRange are considered in this case
             var acc: ?PatternState = null;
             reduce_loop: for (0..stackLen - 1) |i| {
-                acc = switch (stack[@intCast(stackLen - 2 - i)]) {
-                    PatternState.RangeStart => .RangeStart,
-                    PatternState.GroupStart => .GroupStart,
+                acc = switch (stack[@intCast(stackLen - 1 - i)]) {
+                    PatternState.RangeStart => .ValidRange,
+                    PatternState.GroupStart => .ValidGroup,
                     else => null,
                 };
                 if (acc != null) {
@@ -416,7 +417,7 @@ const PatternParseState = struct {
                     debug("\tstack: [\n", .{});
                 }
                 if (i == self.patternStateStack.?.len - 1) {
-                    debug("\t\\t\tt{}\n\t]\n", .{patternState});
+                    debug("\t\t\tt{}\n\t]\n", .{patternState});
                     break;
                 }
                 debug("{}, ", .{patternState});
@@ -458,7 +459,7 @@ const PatternParseState = struct {
 };
 
 const RegexPatternParseError = error{ IncompleteGroupPattern, IncompleteOrPattern, IncompleteRangePattern, InvalidPattern, InvalidGroupPattern, WrongLowerAndUpperBound, OutOfMemory };
-
+const StackStateSymbol = struct { symbol: SymbolValue, state: PatternState };
 pub const Regex = struct {
     const Self = @This();
 
@@ -508,10 +509,10 @@ pub const Regex = struct {
 
     ///Compile regular expression
     pub fn compile(self: *Self, pattern: []const u8) !void {
-        var stack = std.ArrayList(SymbolValue).init(self.allocator);
+        var stack = std.ArrayList(StackStateSymbol).init(self.allocator);
         var patterns = std.ArrayList(Pattern).init(self.allocator);
         var states = std.ArrayList(PatternState).init(self.allocator);
-        var lastValid: ?SymbolValue = null;
+        var lastValid: ?StackStateSymbol = null;
         try self.patternState.lex(pattern);
         try self.patternState.walk();
         try states.appendSlice(self.patternState.patternHistory);
@@ -521,28 +522,39 @@ pub const Regex = struct {
             for (states.items, 0..) |state, i| {
                 switch (state) {
                     .Valid => blk: {
-                        lastValid = self.patternState.symbols.?[i];
+                        lastValid = StackStateSymbol{ .symbol = self.patternState.symbols.?[i], .state = state };
                         break :blk;
                     },
                     .ValidWithQualifier => blk: {
                         const stateSymbol = self.patternState.symbols.?[i];
                         lastValid = null;
-                        try stack.append(stateSymbol);
+                        try stack.append(StackStateSymbol{ .symbol = stateSymbol, .state = state });
                         const builtPattern = try self.buildPattern(stack.items);
                         try patterns.append(builtPattern);
                         try stack.resize(0);
                         break :blk;
                     },
                     .QualifierStart => blk: {
-                        try stack.append(self.patternState.symbols.?[i]);
+                        const stateSymbol = self.patternState.symbols.?[i];
+                        try stack.append(StackStateSymbol{ .symbol = stateSymbol, .state = state });
                         break :blk;
                     },
                     .ValidQualifier => blk: {
-                        try stack.append(self.patternState.symbols.?[i]);
+                        const stateSymbol = self.patternState.symbols.?[i];
+                        try stack.append(StackStateSymbol{ .symbol = stateSymbol, .state = state });
                         break :blk;
                     },
                     else => {
-                        try stack.append(self.patternState.symbols.?[i]);
+                        const stateSymbol = self.patternState.symbols.?[i];
+                        if (lastValid != null) {
+                            try stack.append(StackStateSymbol{ .symbol = lastValid.?.symbol, .state = state });
+                            const builtPattern = try self.buildPattern(stack.items);
+                            try patterns.append(builtPattern);
+                            try stack.resize(0);
+                            lastValid = null;
+                        } else {
+                            try stack.append(StackStateSymbol{ .symbol = stateSymbol, .state = state });
+                        }
                     },
                 }
             }
@@ -553,100 +565,39 @@ pub const Regex = struct {
         self.patterns = patterns.items;
     }
 
-    fn buildPattern(self: *Self, symbols: []SymbolValue) !Pattern {
-        const PatternStackEntry = struct { current: Pattern, nested: ?std.ArrayList(Pattern) = null };
-        var patternStack = util.Stack(PatternStackEntry).init(self.allocator);
-        var nestedPatterns = std.ArrayList(Pattern).init(self.allocator);
+    fn buildPattern(self: *Self, stack: []StackStateSymbol) !Pattern {
+        _ = self;
         var current = Pattern{};
-        for (symbols) |symbol| {
-            switch (symbol.type) {
-                Symbols.open_p => blk: {
-                    switch (current.type) {
-                        .Empty => iblk: {
-                            current.type = PatternType.Group;
-                            current.startIndex = symbol.index;
-                            break :iblk;
-                        },
-                        .Group => iblk: {
-                            try patternStack.push(PatternStackEntry{ .current = current, .nested = nestedPatterns });
-                            break :iblk;
-                        },
-                        else => unreachable,
-                    }
-                    break :blk;
-                },
-                Symbols.close_p => blk: {
-                    switch (current.type) {
-                        .Group => iblk: {
-                            if (!patternStack.isEmpty()) {
-                                var parentPattern = patternStack.pop();
-                                try parentPattern.nested.?.append(current);
-                                nestedPatterns = parentPattern.nested.?;
-                                current = parentPattern.current;
-                            }
-                            break :iblk;
-                        },
-                        else => unreachable,
-                    }
-                    break :blk;
-                },
-                Symbols.num => blk: {
-                    switch (current.type) {
-                        .Group => iblk: {
-                            if (!patternStack.isEmpty()) {
-                                try nestedPatterns.append(Pattern{});
-                            }
-                            break :iblk;
-                        },
-                        else => unreachable,
-                    }
-                    break :blk;
-                },
-                Symbols.char => blk: {
-                    break :blk;
-                },
-                Symbols.lit => blk: {
-                    break :blk;
-                },
-                Symbols.ror => blk: {
-                    break :blk;
-                },
-                Symbols.cap => blk: {
-                    break :blk;
-                },
-                Symbols.open_c => blk: {
-                    break :blk;
-                },
-                Symbols.close_c => blk: {
-                    break :blk;
-                },
-                Symbols.open_b => blk: {
-                    break :blk;
-                },
-                Symbols.close_b => blk: {
-                    break :blk;
-                },
-                Symbols.star => blk: {
-                    break :blk;
-                },
-                Symbols.plus => blk: {
-                    break :blk;
-                },
-                Symbols.dash => blk: {
-                    break :blk;
-                },
-                Symbols.point => blk: {
-                    break :blk;
-                },
-                Symbols.escape => blk: {
-                    break :blk;
-                },
-                Symbols.comma => blk: {
-                    break :blk;
-                },
-                else => blk: {
-                    break :blk;
-                },
+        current.type = switch (stack[0].state) {
+            .GroupStart => .Group,
+            // it's a literal because it's the only possible case
+            .Valid => .Literal,
+            .NeedsEscapeChar => .Literal,
+            .RangeStart => .Range,
+            .ValidOr => .Or,
+            .StartsWith => .StartsWith,
+            .EndsWith => .EndsWith,
+        };
+        if(stack.len > 1) {
+            for (stack[1 .. stack.len - 1], 0..) |entry, i| {
+                switch (current.type) {
+                    .Group => blk: {
+                        break :blk;
+                    },
+                    .Range => blk: {
+                        break :blk;
+                    },
+                    .Or => blk: {
+                        break :blk;
+                    },
+                    .StartsWith => blk: {
+                        break :blk;
+                    },
+                    .EndsWith => blk: {
+                        break :blk;
+                    },
+                    else => unreachable
+                }
             }
         }
         return current;
