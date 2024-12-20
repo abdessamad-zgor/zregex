@@ -1,14 +1,21 @@
 const std = @import("std");
-const util = @import("./util.zig");
+const uarr = @import("../util/arr.zig");
 const debug = std.debug.print;
 const Allocator = std.mem.Allocator;
 
-pub const PatternType = enum { Or, Literal, ExclusiveRange, Range, Group, Empty };
+pub const PatternType = enum { Or, Literal, ExclusiveRange, Range, Group, StartsWith, EndsWith, Escape, Any, Empty };
 
+pub const StackStateSymbol = struct { symbol: SymbolValue, state: PatternState };
+pub const RegexPatternParseError = error{ IncompleteGroupPattern, IncompleteOrPattern, IncompleteRangePattern, InvalidPattern, InvalidGroupPattern, WrongLowerAndUpperBound, OutOfMemory };
+pub const PatternSubExpressionsTag = enum { children, branches, symbols };
+pub const PatternSubExpressions = union(PatternSubExpressionsTag) { children: []Pattern, branches: [][]Pattern, symbols: []u8 };
 // describes a valid sub expression of a regular expression
-pub const Pattern = struct { symbols: ?[]const u8 = null, patterns: ?[]Pattern = null, qualifier: u8 = '1', type: PatternType = .Empty, startIndex: usize = 0 };
+pub const Pattern = struct { subexps: PatternSubExpressions, quantifier: Quantifier = .One, type: PatternType = .Empty, startIndex: usize = 0 };
+pub const QuantifierTag = enum { One, Any, OneOrMore, MinOrMore, MaxOrLess, BetweenMinMax, Fixed };
 
-pub const PatternStateEnum = enum { RangeStart, Or, QualifierStart, Valid, ValidGroup, ValidWithQualifier, ValidQualifier, ValidDashedRange, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
+pub const Quantifier = union(QuantifierTag) { One: void, Any: void, OneOrMore: void, MinOrMore: u32, MaxOrLess: u32, BetweenMinMax: struct { u32, u32 }, Fixed: u32 };
+
+pub const PatternStateEnum = enum { RangeStart, Or, QuantifierStart, Valid, ValidGroup, ValidWithQuantifier, ValidQuantifier, ValidDashedRange, Dash, ValidRange, GroupStart, NeedsEscapeChar, StartsWith, EndsWith, Error, Init };
 pub const PatternState = union(PatternStateEnum) {
     Init: void,
     RangeStart: void,
@@ -16,8 +23,8 @@ pub const PatternState = union(PatternStateEnum) {
     Or: void,
     Valid: void,
     ValidGroup: void,
-    ValidWithQualifier: void,
-    ValidQualifier: void,
+    ValidWithQuantifier: void,
+    ValidQuantifier: void,
     ValidDashedRange: void,
     ValidRange: void,
     Dash: void,
@@ -42,6 +49,318 @@ pub const PatternParseState = struct {
 
     pub fn init(allocator: Allocator) PatternParseState {
         return PatternParseState{ .patternStateStack = &[_]PatternState{}, .symbols = null, .current = .Init, .allocator = allocator, .patternHistory = &[_]PatternState{} };
+    }
+
+    // TODO: exhaustive list of cases ( Or, EndsWith)
+    pub fn parse(self: *Self) !void {
+        var patterns = std.ArrayList(Pattern).init(self.allocator);
+        var currentPattern: Pattern = Pattern{};
+        if (self.current != .Init) {
+            try self.appendToHistory(self.current);
+        }
+
+        for (self.symbols.?) |symbol| {
+            self.current = switch (self.current) {
+                .Init => switch (symbol) {
+                    .lit => .Valid,
+                    .open_p => blk: {
+                        try self.appendToStack(.GroupStart);
+                        currentPattern.type = .Group;
+                        break :blk .GroupStart;
+                    },
+                    .open_b => blk: {
+                        try self.appendToStack(.RangeStart);
+                        currentPattern.type = .Range;
+                        break :blk .RangeStart;
+                    },
+                    .cap => blk: {
+                        try self.appendToStack(.StartsWith);
+                        currentPattern.type = .StartsWith;
+                        currentPattern.subexps = PatternSubExpressions{ .symbols = &[_]u8{} };
+                        break :blk .StartsWith;
+                    },
+                    .escape => blk: {
+                        currentPattern.type = .Escape;
+                        break :blk .NeedsEscapeChar;
+                    },
+                    .point => blk: {
+                        currentPattern.type = .Any;
+                        try patterns.append(currentPattern);
+                        currentPattern = Pattern{};
+                        break :blk .Valid;
+                    },
+                    .num => blk: {
+                        currentPattern.type = .Literal;
+                        currentPattern.subexps = .{ .symbols = &[_]u8{symbol.value.?} };
+                        try patterns.append(currentPattern);
+                        break :blk .Valid;
+                    },
+                    .char => blk: {
+                        currentPattern.type = .Literal;
+                        currentPattern.subexps = .{ .symbols = &[_]u8{symbol.value.?} };
+                        try patterns.append(currentPattern);
+                        break :blk .Valid;
+                    },
+                    else => .Error,
+                },
+                .StartsWith => switch (symbol) {
+                    .lit => blk: {
+                        try patterns.append(currentPattern);
+                        switch (currentPattern.subexps) {
+                            .symbols => iblk: {
+                                try uarr.appendToArray(u8, self.allocator, currentPattern.subexps.symbols, symbol.value.?);
+                                break :iblk;
+                            },
+                            .children => iblk: {
+                                const lastChild = currentPattern.subexps.children[@intCast(currentPattern.subexps.children.len - 1)];
+                                if (lastChild.type == .Literal) {
+                                    try uarr.appendToArray(u8, self.allocator, currentPattern.subexps.symbols, symbol.value.?);
+                                } else {
+                                    const newLiteralPattern = Pattern{ .type = .Literal, .subexps = .{ .symbols = &[_]u8{symbol.value.?} }, .startIndex = symbol.index };
+                                    try uarr.appendToArray(Pattern, self.allocator, currentPattern.subexps.children, newLiteralPattern);
+                                }
+                                break :iblk;
+                            },
+                            else => unreachable,
+                        }
+                        break :blk .Valid;
+                    },
+                    .num => blk: {
+                        switch (currentPattern.subexps) {
+                            .symbols => iblk: {
+                                try uarr.appendToArray(u8, self.allocator, currentPattern.subexps.symbols, symbol.value.?);
+                                break :iblk;
+                            },
+                            .children => iblk: {
+                                const lastChild = currentPattern.subexps.children[@intCast(currentPattern.subexps.children.len - 1)];
+                                if (lastChild.type == .Literal) {
+                                    try uarr.appendToArray(u8, self.allocator, currentPattern.subexps.symbols, symbol.value.?);
+                                } else {
+                                    const newLiteralPattern = Pattern{ .type = .Literal, .subexps = .{ .symbols = &[_]u8{symbol.value.?} }, .startIndex = symbol.index };
+                                    try uarr.appendToArray(Pattern, self.allocator, currentPattern.subexps.children, newLiteralPattern);
+                                }
+                                break :iblk;
+                            },
+                            else => unreachable,
+                        }
+                        break :blk .Valid;
+                    },
+                    .char => blk: {
+                        switch (currentPattern.subexps) {
+                            .symbols => iblk: {
+                                try uarr.appendToArray(u8, self.allocator, currentPattern.subexps.symbols, symbol.value.?);
+                                break :iblk;
+                            },
+                            .children => iblk: {
+                                const lastChild = currentPattern.subexps.children[@intCast(currentPattern.subexps.children.len - 1)];
+                                if (lastChild.type == .Literal) {
+                                    try uarr.appendToArray(u8, self.allocator, currentPattern.subexps.symbols, symbol.value.?);
+                                } else {
+                                    const newLiteralPattern = Pattern{ .type = .Literal, .subexps = .{ .symbols = &[_]u8{symbol.value.?} }, .startIndex = symbol.index };
+                                    try uarr.appendToArray(Pattern, self.allocator, currentPattern.subexps.children, newLiteralPattern);
+                                }
+                                break :iblk;
+                            },
+                            else => unreachable,
+                        }
+                        break :blk .Valid;
+                    },
+                    .open_b => blk: {
+                        try self.appendToStack(.RangeStart);
+                        try patterns.append(currentPattern);
+                        currentPattern = Pattern{};
+                        currentPattern.type = .Range;
+                        currentPattern.subexps = .{ .symbols = &[_]u8{} };
+                        break :blk .RangeStart;
+                    },
+                    .open_p => blk: {
+                        try self.appendToStack(.GroupStart);
+                        currentPattern = Pattern{};
+                        currentPattern.type = .Group;
+                        currentPattern.subexps = .{ .children = &[_]Pattern{Pattern{}} };
+                        break :blk .GroupStart;
+                    },
+                    .escape => blk: {
+                        currentPattern = Pattern{};
+                        currentPattern.type = .Escape;
+                        currentPattern.subexps = .{ .symbols = &[_]u8{} };
+                        break :blk .NeedsEscapeChar;
+                    },
+                    .point => blk: {
+                        break :blk .Any;
+                    },
+                    else => .Error,
+                },
+                .Valid => switch (symbol) {
+                    .star => .ValidWithQuantifier,
+                    .plus => .ValidWithQuantifier,
+                    .open_c => blk: {
+                        try self.appendToStack(.QuantifierStart);
+                        break :blk .QuantifierStart;
+                    },
+                    .open_b => blk: {
+                        try self.appendToStack(.RangeStart);
+                        break :blk .RangeStart;
+                    },
+                    .open_p => blk: {
+                        try self.appendToStack(.GroupStart);
+                        break :blk .GroupStart;
+                    },
+                    .lit => .Valid,
+                    .num => .Valid,
+                    .char => .Valid,
+                    .point => .Valid,
+                    .ror => blk: {
+                        try self.appendToStack(self.patternHistory[0 .. self.patternHistory.len - 1]);
+                        break :blk .Or;
+                    },
+                    else => .Error,
+                },
+                .ValidWithQuantifier => switch (symbol) {
+                    .lit => .Valid,
+                    .num => .Valid,
+                    .char => .Valid,
+                    .open_b => .RangeStart,
+                    .open_p => .GroupStart,
+                    else => .Error,
+                },
+                .QuantifierStart => switch (symbol) {
+                    .num => .ValidQuantifier,
+                    .comma => .ValidQuantifier,
+                    .close_c => .ValidWithQuantifier,
+                    else => .Error,
+                },
+                .GroupStart => switch (symbol) {
+                    .num => .ValidGroup,
+                    .char => .ValidGroup,
+                    .lit => .ValidGroup,
+                    .escape => .NeedsEscapeChar,
+                    else => .Error,
+                },
+                .RangeStart => switch (symbol) {
+                    .num => .ValidRange,
+                    .char => .ValidRange,
+                    .lit => .ValidRange,
+                    .escape => .NeedsEscapeChar,
+                    else => .Error,
+                },
+                .ValidRange => switch (symbol) {
+                    .num => .ValidRange,
+                    .char => .ValidRange,
+                    .lit => .ValidRange,
+                    .dash => .Dash,
+                    .escape => .NeedsEscapeChar,
+                    .close_b => blk: {
+                        const openState = self.findStackState(.RangeStart);
+                        if (openState == 0) {
+                            self.emptyStack(openState);
+                            break :blk .Valid;
+                        } else {
+                            self.emptyStack(openState);
+                            const nestedConstructState = self.getParentState();
+                            break :blk nestedConstructState.?;
+                        }
+                    },
+                    else => .Error,
+                },
+                .Dash => switch (symbol) {
+                    .num => .ValidDashedRange,
+                    .char => .ValidDashedRange,
+                    .lit => .ValidDashedRange,
+                    else => .Error,
+                },
+                .ValidDashedRange => switch (symbol) {
+                    .num => .ValidRange,
+                    .char => .ValidRange,
+                    .lit => .ValidRange,
+                    .close_b => .Valid,
+                    else => .Error,
+                },
+                .NeedsEscapeChar => blk: {
+                    const reducedStackState = self.getParentState();
+                    debug("reducedState: {?}\n", .{reducedStackState});
+                    if (reducedStackState == null) {
+                        break :blk .Valid;
+                    } else {
+                        break :blk reducedStackState.?;
+                    }
+                },
+                .ValidGroup => switch (symbol) {
+                    .close_p => blk: {
+                        const openState = self.findStackState(.GroupStart);
+                        std.debug.assert(openState != null);
+                        if (openState.? == 0) {
+                            self.emptyStack(openState);
+                            break :blk .Valid;
+                        } else {
+                            self.emptyStack(openState);
+                            const reducedStackState = self.getParentState();
+                            if (reducedStackState == null) {
+                                break :blk .Valid;
+                            } else {
+                                break :blk reducedStackState.?;
+                            }
+                        }
+                    },
+                    .ror => .Or,
+                    .escape => .NeedsEscapeChar,
+                    .num => .ValidGroup,
+                    .char => .ValidGroup,
+                    .lit => .ValidGroup,
+                    else => .Error,
+                },
+                .Or => switch (symbol) {
+                    .close_p => blk: {
+                        const nestedPatternState = self.getParentState();
+                        if (nestedPatternState == null) {
+                            break :blk .Valid;
+                        } else {
+                            break :blk nestedPatternState.?;
+                        }
+                    },
+                    .num => blk: {
+                        const nestedPatternState = self.getParentState();
+                        if (nestedPatternState == null) {
+                            break :blk .Valid;
+                        } else {
+                            break :blk nestedPatternState.?;
+                        }
+                    },
+                    .char => blk: {
+                        const nestedPatternState = self.getParentState();
+                        if (nestedPatternState == null) {
+                            break :blk .Valid;
+                        } else {
+                            break :blk nestedPatternState.?;
+                        }
+                    },
+                    .lit => blk: {
+                        const nestedPatternState = self.getParentState();
+                        if (nestedPatternState == null) {
+                            break :blk .Valid;
+                        } else {
+                            break :blk nestedPatternState.?;
+                        }
+                    },
+                    .escape => .NeedsEscapeChar,
+                    else => .Error,
+                },
+                .ValidQuantifier => switch (symbol) {
+                    .close_c => blk: {
+                        const nestedPatternState = self.getParentState();
+                        if (nestedPatternState == null) {
+                            break :blk .Valid;
+                        } else {
+                            break :blk nestedPatternState.?;
+                        }
+                    },
+                    .num => .ValidQuantifier,
+                    else => .Error,
+                },
+                .EndsWith => .Error,
+                .Error => .Error,
+            };
+        }
     }
 
     fn lex(self: *Self, pattern: []const u8) !void {
@@ -107,279 +426,14 @@ pub const PatternParseState = struct {
         self.symbols = patternSymbols.items;
     }
 
-    // TODO: exhaustive list of cases ( Or, EndsWith)
-    pub fn parse(self: *Self, symbol: Symbols) !void {
-        var patterns = std.ArrayList(Pattern).init(self.allocator);
-        var currentPattern: Pattern = Pattern{};
-        if (self.current != .Init) {
-            try self.appendToHistory(self.current);
-        }
-        self.current = switch (self.current) {
-            .Init => switch (symbol) {
-                .lit => .Valid,
-                .open_p => blk: {
-                    try self.appendToStack(.{ .GroupStart = void });
-                    switch (currentPattern.type) {
-                        .Group => iblk: {
-                            try patterns.append(currentPattern);
-                            currentPattern = Pattern{};
-                            currentPattern.type = .Group;
-                            break :iblk;
-                        },
-                        .Empty => iblk: {
-                            currentPattern.type = .Group;
-                            break :iblk;
-                        },
-                        else => unreachable,
-                    }
-                    break :blk .GroupStart;
-                },
-                .open_b => blk: {
-                    try self.appendToStack(.RangeStart);
-                    switch (currentPattern.type) {
-                        .Group => iblk: {
-                            try patterns.append(currentPattern);
-                            currentPattern = Pattern{};
-                            currentPattern.type = .Range;
-                            break :iblk;
-                        },
-                        .Empty => iblk: {
-                            currentPattern.type = .Range;
-                            break :iblk;
-                        },
-                        else => unreachable,
-                    }
-                    break :blk .RangeStart;
-                },
-                .cap => blk: {
-                    try self.appendToStack(.StartsWith);
-                    break :blk .StartsWith;
-                },
-                .escape => .NeedsEscapeChar,
-                .point => .Valid,
-                .num => .Valid,
-                .char => .Valid,
-                else => .Error,
-            },
-            .StartsWith => switch (symbol) {
-                .lit => .Valid,
-                .num => .Valid,
-                .char => .Valid,
-                .open_b => blk: {
-                    try self.appendToStack(.RangeStart);
-                    break :blk .RangeStart;
-                },
-                .open_p => blk: {
-                    try self.appendToStack(.GroupStart);
-                    break :blk .GroupStart;
-                },
-                .escape => .NeedsEscapeChar,
-                .point => .Valid,
-                else => .Error,
-            },
-            .Valid => switch (symbol) {
-                .star => .ValidWithQualifier,
-                .plus => .ValidWithQualifier,
-                .open_c => blk: {
-                    try self.appendToStack(.QualifierStart);
-                    break :blk .QualifierStart;
-                },
-                .open_b => blk: {
-                    try self.appendToStack(.RangeStart);
-                    break :blk .RangeStart;
-                },
-                .open_p => blk: {
-                    try self.appendToStack(.GroupStart);
-                    break :blk .GroupStart;
-                },
-                .lit => .Valid,
-                .num => .Valid,
-                .char => .Valid,
-                .point => .Valid,
-                .ror => blk: {
-                    try self.appendToStack(self.patternHistory[0 .. self.patternHistory.len - 1]);
-                    break :blk .Or;
-                },
-                else => .Error,
-            },
-            .ValidWithQualifier => switch (symbol) {
-                .lit => .Valid,
-                .num => .Valid,
-                .char => .Valid,
-                .open_b => .RangeStart,
-                .open_p => .GroupStart,
-                else => .Error,
-            },
-            .QualifierStart => switch (symbol) {
-                .num => .ValidQualifier,
-                .comma => .ValidQualifier,
-                .close_c => .ValidWithQualifier,
-                else => .Error,
-            },
-            .GroupStart => switch (symbol) {
-                .num => .ValidGroup,
-                .char => .ValidGroup,
-                .lit => .ValidGroup,
-                .escape => .NeedsEscapeChar,
-                else => .Error,
-            },
-            .RangeStart => switch (symbol) {
-                .num => .ValidRange,
-                .char => .ValidRange,
-                .lit => .ValidRange,
-                .escape => .NeedsEscapeChar,
-                else => .Error,
-            },
-            .ValidRange => switch (symbol) {
-                .num => .ValidRange,
-                .char => .ValidRange,
-                .lit => .ValidRange,
-                .dash => .Dash,
-                .escape => .NeedsEscapeChar,
-                .close_b => blk: {
-                    const openState = self.findStackState(.RangeStart);
-                    if (openState == 0) {
-                        self.emptyStack(openState);
-                        break :blk .Valid;
-                    } else {
-                        self.emptyStack(openState);
-                        const nestedConstructState = self.getParentState();
-                        break :blk nestedConstructState.?;
-                    }
-                },
-                else => .Error,
-            },
-            .Dash => switch (symbol) {
-                .num => .ValidDashedRange,
-                .char => .ValidDashedRange,
-                .lit => .ValidDashedRange,
-                else => .Error,
-            },
-            .ValidDashedRange => switch (symbol) {
-                .num => .ValidRange,
-                .char => .ValidRange,
-                .lit => .ValidRange,
-                .close_b => .Valid,
-                else => .Error,
-            },
-            .NeedsEscapeChar => blk: {
-                const reducedStackState = self.getParentState();
-                debug("reducedState: {?}\n", .{reducedStackState});
-                if (reducedStackState == null) {
-                    break :blk .Valid;
-                } else {
-                    break :blk reducedStackState.?;
-                }
-            },
-            .ValidGroup => switch (symbol) {
-                .close_p => blk: {
-                    const openState = self.findStackState(.GroupStart);
-                    std.debug.assert(openState != null);
-                    if (openState.? == 0) {
-                        self.emptyStack(openState);
-                        break :blk .Valid;
-                    } else {
-                        self.emptyStack(openState);
-                        const reducedStackState = self.getParentState();
-                        if (reducedStackState == null) {
-                            break :blk .Valid;
-                        } else {
-                            break :blk reducedStackState.?;
-                        }
-                    }
-                },
-                .ror => .Or,
-                .escape => .NeedsEscapeChar,
-                .num => .ValidGroup,
-                .char => .ValidGroup,
-                .lit => .ValidGroup,
-                else => .Error,
-            },
-            .Or => switch (symbol) {
-                .close_p => blk: {
-                    const nestedPatternState = self.getParentState();
-                    if (nestedPatternState == null) {
-                        break :blk .Valid;
-                    } else {
-                        break :blk nestedPatternState.?;
-                    }
-                },
-                .num => blk: {
-                    const nestedPatternState = self.getParentState();
-                    if (nestedPatternState == null) {
-                        break :blk .Valid;
-                    } else {
-                        break :blk nestedPatternState.?;
-                    }
-                },
-                .char => blk: {
-                    const nestedPatternState = self.getParentState();
-                    if (nestedPatternState == null) {
-                        break :blk .Valid;
-                    } else {
-                        break :blk nestedPatternState.?;
-                    }
-                },
-                .lit => blk: {
-                    const nestedPatternState = self.getParentState();
-                    if (nestedPatternState == null) {
-                        break :blk .Valid;
-                    } else {
-                        break :blk nestedPatternState.?;
-                    }
-                },
-                .escape => .NeedsEscapeChar,
-                else => .Error,
-            },
-            .ValidQualifier => switch (symbol) {
-                .close_c => blk: {
-                    const nestedPatternState = self.getParentState();
-                    if (nestedPatternState == null) {
-                        break :blk .Valid;
-                    } else {
-                        break :blk nestedPatternState.?;
-                    }
-                },
-                .num => .ValidQualifier,
-                else => .Error,
-            },
-            .EndsWith => .Error,
-            .Error => .Error,
-        };
-    }
-
-    fn walk(self: *Self) !void {
-        for (self.symbols.?) |symbol| {
-            try self.patternStateOnSymbol(symbol.type);
-            //self.printPatternParseState();
-        }
-        self.printPatternParseState();
-    }
-
     fn appendToHistory(self: *Self, state: PatternState) !void {
         const stack = self.patternHistory;
-        var patternHistoryBuffer = std.ArrayList(PatternState).init(self.allocator);
-        const stackLen = stack.len;
-        try patternHistoryBuffer.resize(stackLen + 1);
-        const patternHistory: []PatternState = patternHistoryBuffer.items;
-        for (stack, 0..) |value, i| {
-            patternHistory[i] = value;
-        }
-        patternHistory[stackLen] = state;
-        self.patternHistory = patternHistory;
+        self.patternHistory = try uarr.appendToArray(PatternState, self.allocator, stack, state);
     }
 
     fn appendToStack(self: *Self, state: PatternState) !void {
         const stack = self.patternStateStack orelse &[_]PatternState{};
-        var patternStateBuffer = std.ArrayList(PatternState).init(self.allocator);
-        const stackLen = stack.len;
-        try patternStateBuffer.resize(stackLen + 1);
-        const patternStateStack: []PatternState = patternStateBuffer.items;
-        for (stack, 0..) |value, i| {
-            patternStateStack[i] = value;
-        }
-        patternStateStack[stackLen] = state;
-        self.patternStateStack = patternStateStack;
+        self.patternStateStack = try uarr.appendToArray(PatternState, self.allocator, stack, state);
     }
 
     fn emptyStack(self: *Self, index: ?usize) void {
@@ -499,6 +553,3 @@ pub const PatternParseState = struct {
         }
     }
 };
-
-pub const StackStateSymbol = struct { symbol: SymbolValue, state: PatternState };
-pub const RegexPatternParseError = error{ IncompleteGroupPattern, IncompleteOrPattern, IncompleteRangePattern, InvalidPattern, InvalidGroupPattern, WrongLowerAndUpperBound, OutOfMemory };

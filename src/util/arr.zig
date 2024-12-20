@@ -24,6 +24,19 @@ pub fn Stack(comptime T: type) type {
     };
 }
 
+pub fn appendToArray(comptime T: type, allocator: Allocator, arr: []T, elem: T) ![]T {
+    var tBuffer = std.ArrayList(T).init(allocator);
+    defer tBuffer.deinit();
+    const arrLen = arr.len;
+    try tBuffer.resize(arrLen + 1);
+    const tArr: []T = tBuffer.items;
+    for (arr, 0..) |value, i| {
+        tArr[i] = value;
+    }
+    tArr[arrLen] = elem;
+    return tArr;
+}
+
 test "stack test" {
     var stack = Stack(u8).init(std.heap.page_allocator);
 
